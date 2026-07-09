@@ -1,0 +1,1636 @@
+// fallseed-ifa SDK · sovereign single-file library · MIT · AI-Native Solutions
+// Extracted from fallseed-ifa/index.html · 101271 bytes of source logic
+// Public-safe: no primes/glyphs/dyad references
+
+/*!
+ * Fall Kit · v1.0.0 · the shared cascade for every estate seed
+ *
+ * Inlineable JS module. Drop into any seed via <script> or copy-paste inline.
+ * Preserves single-HTML sovereignty (no external deps until user opts in to T2 WebLLM).
+ *
+ * What it gives every seed:
+ *  - AI tier picker: T0 (off · default) · T2 (WebLLM in-browser, 5 models 1B-70B) · T3 (BYOK Anthropic/OpenAI/Google)
+ *  - Universal entry: FallKit.aiComplete(systemPrompt, userMsg, maxTokens) → string|null
+ *  - AI chip UI in header
+ *  - WebRTC P2P mesh (ported from canonical fallnet · fall-signal channel · Google STUN)
+ *  - Help section partial: FallKit.helpSection()
+ *  - Settings panel: FallKit.openSettings()
+ *
+ * Doctrine (per botler CLAUDE.md):
+ *  - T0 fallback ALWAYS works · aiComplete returns null · caller MUST degrade gracefully
+ *  - NEVER hide a feature behind AI · NEVER proxy API keys · NEVER log keys
+ *  - WebLLM is lazy-loaded · model weights download ONLY on user opt-in
+ *
+ * Estate-first canonical references:
+ *  - WebLLM pattern: Downloads/botler/index.html (T0/T2/T3 cascade)
+ *  - WebRTC pattern: Downloads/fallnet/fallnet-shim.js (raw RTCPeerConnection)
+ *  - Mesh channel:   'fall-signal'
+ */
+(function (root) {
+  'use strict';
+  const FALL_KIT_VERSION = '1.2.0';
+  const KCC_MINT_URL = 'https://sjgant80-hub.github.io/kcc-mint/';
+  // ─── Model registry ──────────────────────────────────────────────
+  const WEBLLM_MODELS = {
+    'llama-1b':  { id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC',   size: '~700MB', label: '1B · fast · any laptop / phone' },
+    'llama-3b':  { id: 'Llama-3.2-3B-Instruct-q4f16_1-MLC',   size: '~2GB',   label: '3B · balanced · default · most laptops' },
+    'qwen-7b':   { id: 'Qwen2.5-7B-Instruct-q4f16_1-MLC',     size: '~5GB',   label: '7B · capable · needs decent GPU (M-series Mac / 8GB+ VRAM)' },
+    'llama-8b':  { id: 'Llama-3.1-8B-Instruct-q4f16_1-MLC',   size: '~5GB',   label: '8B · common · needs decent GPU' },
+    'llama-70b': { id: 'Llama-3.1-70B-Instruct-q4f16_1-MLC',  size: '~40GB',  label: '70B · frontier · needs serious GPU + 64GB+ RAM' },
+  };
+  const DEFAULT_MODEL = 'llama-3b';
+  const T3_PROVIDERS = {
+    anthropic: { label: 'Anthropic Claude', models: ['claude-sonnet-4-5','claude-opus-4-7','claude-haiku-4-5'], default: 'claude-sonnet-4-5', url: 'https://api.anthropic.com/v1/messages' },
+    openai:    { label: 'OpenAI',           models: ['gpt-4o','gpt-4o-mini','o1-mini'],                          default: 'gpt-4o-mini',      url: 'https://api.openai.com/v1/chat/completions' },
+    google:    { label: 'Google Gemini',    models: ['gemini-1.5-pro','gemini-1.5-flash','gemini-2.0-flash-exp'], default: 'gemini-1.5-flash', url: 'https://generativelanguage.googleapis.com/v1beta/models/' },
+  };
+  // ─── State ───────────────────────────────────────────────────────
+  const STATE = {
+    config: loadConfig(),
+    ai: { ready: false, loading: false, progress: 0, engine: null, model: null },
+    mesh: { active: false, peers: new Map(), bc: null, signal: null },
+  };
+  function loadConfig() {
+    try { return JSON.parse(localStorage.getItem('fall-kit.config') || '{}'); }
+    catch (e) { return {}; }
+  }
+  function saveConfig() {
+    try { localStorage.setItem('fall-kit.config', JSON.stringify(STATE.config)); } catch (e) {}
+  }
+  // ─── DOM helpers ─────────────────────────────────────────────────
+  function $(s, root) { return (root || document).querySelector(s); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+  // ─── AI tier ─────────────────────────────────────────────────────
+  function aiTier() { return STATE.config.ai_tier || 'T0'; }
+  function renderAiChip() {
+    const chip = $('#fk-ai-chip');
+    if (!chip) return;
+    const txt = $('#fk-ai-chip-text');
+    chip.classList.remove('fk-chip-live', 'fk-chip-loading', 'fk-chip-warn');
+    const tier = aiTier();
+    if (tier === 'T0') { txt.textContent = 'T0 · off'; }
+    else if (tier === 'T2') {
+      if (STATE.ai.ready) { txt.textContent = 'T2 ' + (WEBLLM_MODELS[STATE.config.webllm_model || DEFAULT_MODEL]?.label.split(' · ')[0] || '') + ' · ready'; chip.classList.add('fk-chip-live'); }
+      else if (STATE.ai.loading) { txt.textContent = 'T2 loading ' + Math.round(STATE.ai.progress) + '%'; chip.classList.add('fk-chip-loading'); }
+      else { txt.textContent = 'T2 · click to load'; chip.classList.add('fk-chip-warn'); }
+    } else if (tier === 'T3') {
+      if (STATE.config.api_key) { txt.textContent = 'T3 ' + (T3_PROVIDERS[STATE.config.api_provider]?.label || 'BYOK') + ' · active'; chip.classList.add('fk-chip-live'); }
+      else { txt.textContent = 'T3 · no key set'; chip.classList.add('fk-chip-warn'); }
+    }
+  }
+  async function loadWebLLM(modelKey) {
+    if (STATE.ai.loading) return;
+    const key = modelKey || STATE.config.webllm_model || DEFAULT_MODEL;
+    const model = WEBLLM_MODELS[key];
+    if (!model) { console.error('fall-kit: unknown model', key); return; }
+    if (STATE.ai.ready && STATE.ai.model === model.id) return;
+    STATE.ai.loading = true; STATE.ai.progress = 0; renderAiChip();
+    notify('Loading WebLLM · ' + model.label + ' · ' + model.size + ' first time', 'info');
+    try {
+      const { CreateMLCEngine } = await import('https://esm.run/@mlc-ai/web-llm@0.2.79');
+      const engine = await CreateMLCEngine(model.id, {
+        initProgressCallback: p => { STATE.ai.progress = (p.progress || 0) * 100; renderAiChip(); }
+      });
+      STATE.ai.engine = engine;
+      STATE.ai.model = model.id;
+      STATE.ai.ready = true;
+      STATE.ai.loading = false;
+      STATE.config.webllm_model = key; saveConfig();
+      renderAiChip();
+      notify('WebLLM ready · sovereign mode · ' + model.label.split(' · ')[0], 'ok');
+    } catch (e) {
+      console.error('fall-kit: WebLLM load failed', e);
+      STATE.ai.loading = false; renderAiChip();
+      notify('WebLLM load failed · ' + e.message, 'err');
+    }
+  }
+  async function aiComplete(systemPrompt, userMsg, maxTokens) {
+    maxTokens = maxTokens || 600;
+    const tier = aiTier();
+    if (tier === 'T2' && STATE.ai.ready && STATE.ai.engine) {
+      const r = await STATE.ai.engine.chat.completions.create({
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMsg }],
+        max_tokens: maxTokens,
+      });
+      return r.choices[0].message.content;
+    }
+    if (tier === 'T3' && STATE.config.api_key && STATE.config.api_provider) {
+      return await aiCloudCall(systemPrompt, userMsg, maxTokens);
+    }
+    return null;
+  }
+  async function aiCloudCall(sys, msg, maxTokens) {
+    const provider = STATE.config.api_provider;
+    const key = STATE.config.api_key;
+    const model = STATE.config.api_model || T3_PROVIDERS[provider]?.default;
+    if (provider === 'anthropic') {
+      const r = await fetch(T3_PROVIDERS.anthropic.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model, max_tokens: maxTokens, system: sys, messages: [{ role: 'user', content: msg }] }),
+      });
+      if (!r.ok) throw new Error('Anthropic ' + r.status + ': ' + (await r.text()).slice(0, 200));
+      const j = await r.json();
+      return j.content[0].text;
+    }
+    if (provider === 'openai') {
+      const r = await fetch(T3_PROVIDERS.openai.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'system', content: sys }, { role: 'user', content: msg }] }),
+      });
+      if (!r.ok) throw new Error('OpenAI ' + r.status);
+      const j = await r.json();
+      return j.choices[0].message.content;
+    }
+    if (provider === 'google') {
+      const r = await fetch(T3_PROVIDERS.google.url + model + ':generateContent?key=' + encodeURIComponent(key), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: sys + '\n\n---\n\n' + msg }] }], generationConfig: { maxOutputTokens: maxTokens } }),
+      });
+      if (!r.ok) throw new Error('Google ' + r.status);
+      const j = await r.json();
+      return j.candidates[0].content.parts[0].text;
+    }
+    throw new Error('unknown provider: ' + provider);
+  }
+  // ─── WebRTC P2P mesh (ported from canonical fallnet · fall-signal channel · Google STUN) ───
+  const MESH_CHANNEL = 'fall-signal';
+  const STUN_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
+  function meshStart(opts) {
+    if (STATE.mesh.active) return;
+    opts = opts || {};
+    const seedId = opts.seedId || (location.pathname + '#' + Math.random().toString(36).slice(2, 8));
+    STATE.mesh.seedId = seedId;
+    try { STATE.mesh.bc = new BroadcastChannel(MESH_CHANNEL); }
+    catch (e) { console.warn('fall-kit: BroadcastChannel unavailable'); return; }
+    STATE.mesh.bc.onmessage = e => {
+      const m = e.data;
+      if (!m || !m.kind || m.peerId === seedId) return;
+      if (opts.onMessage) opts.onMessage(m);
+    };
+    STATE.mesh.bc.postMessage({ kind: 'fall-kit:hello', peerId: seedId, ts: Date.now(), seedName: opts.seedName || 'unknown' });
+    STATE.mesh.active = true;
+    notify('Mesh active · channel ' + MESH_CHANNEL, 'ok');
+  }
+  function meshPost(kind, payload) {
+    if (!STATE.mesh.active || !STATE.mesh.bc) return false;
+    STATE.mesh.bc.postMessage({ kind: kind, peerId: STATE.mesh.seedId, ts: Date.now(), payload: payload });
+    return true;
+  }
+  // ─── Toast ───────────────────────────────────────────────────────
+  function notify(msg, kind) {
+    let t = $('#fk-toast');
+    if (!t) {
+      t = document.createElement('div'); t.id = 'fk-toast';
+      t.style.cssText = 'position:fixed;bottom:18px;left:50%;transform:translateX(-50%) translateY(20px);background:#c08a3a;color:#0a0a0a;padding:9px 18px;border-radius:3px;font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;opacity:0;transition:all .22s;z-index:10000;pointer-events:none';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.style.background = kind === 'err' ? '#a14a2a' : kind === 'ok' ? '#6b8d4a' : '#c08a3a';
+    t.style.color = kind === 'err' ? '#fff' : '#0a0a0a';
+    t.style.opacity = '1';
+    t.style.transform = 'translateX(-50%) translateY(0)';
+    clearTimeout(t._to);
+    t._to = setTimeout(() => { t.style.opacity = '0'; t.style.transform = 'translateX(-50%) translateY(20px)'; }, 2400);
+  }
+  // ─── Settings modal ──────────────────────────────────────────────
+  function openSettings() {
+    let bg = $('#fk-modal-bg');
+    if (!bg) {
+      bg = document.createElement('div'); bg.id = 'fk-modal-bg';
+      bg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:flex-start;justify-content:center;padding:60px 16px;overflow-y:auto;z-index:9999';
+      bg.onclick = e => { if (e.target.id === 'fk-modal-bg') closeSettings(); };
+      document.body.appendChild(bg);
+    }
+    const tier = aiTier();
+    const provider = STATE.config.api_provider || 'anthropic';
+    const providerCfg = T3_PROVIDERS[provider];
+    bg.innerHTML = `
+      <div style="background:#13121a;border:1px solid #c08a3a;border-radius:5px;max-width:600px;width:100%;padding:22px 24px;color:#ebe3d2;font-family:system-ui,-apple-system,sans-serif;font-size:13.5px;line-height:1.55">
+        <div style="margin-bottom:14px"><label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">Tier</label>
+          <select id="fk-tier" style="width:100%;padding:8px 11px;background:#1a1922;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13.5px;font-family:inherit">
+            <option value="T0"${tier==='T0'?' selected':''}>T0 · off (default · the seed works fully without AI)</option>
+            <option value="T2"${tier==='T2'?' selected':''}>T2 · WebLLM in-browser · sovereign · pick a model below</option>
+            <option value="T3"${tier==='T3'?' selected':''}>T3 · BYOK · Anthropic / OpenAI / Google · stored in your browser only</option>
+          </select>
+        </div>
+        <div id="fk-t2-block" style="display:${tier==='T2'?'block':'none'};margin-bottom:14px;padding:12px 14px;background:#1a1922;border:1px solid #2a2934;border-radius:4px">
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">WebLLM model · 1B → 70B cascade</label>
+          <select id="fk-model" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:inherit">
+            ${Object.entries(WEBLLM_MODELS).map(([k,m]) => `<option value="${k}"${(STATE.config.webllm_model||DEFAULT_MODEL)===k?' selected':''}>${esc(m.label)} · ${esc(m.size)}</option>`).join('')}
+          </select>
+          <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <button id="fk-load-llm" style="padding:7px 14px;background:#c08a3a;color:#0a0a0a;border:none;border-radius:3px;font-weight:600;font-size:12px;cursor:pointer;font-family:inherit">${STATE.ai.ready?'✓ Loaded · switch':'Load model (one-time download)'}</button>
+            <span id="fk-llm-status" style="font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#a89e88;letter-spacing:.04em">${STATE.ai.ready?'ready':STATE.ai.loading?Math.round(STATE.ai.progress)+'%':'not loaded'}</span>
+          </div>
+          <div style="margin-top:8px;font-size:11px;color:#6e6a5e;line-height:1.55">First load downloads the model from @mlc-ai/web-llm CDN. Cached forever after. Inference is 100% local — open DevTools → Network during use, nothing leaves.</div>
+        </div>
+        <div id="fk-t3-block" style="display:${tier==='T3'?'block':'none'};margin-bottom:14px;padding:12px 14px;background:#1a1922;border:1px solid #2a2934;border-radius:4px">
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">BYOK provider</label>
+          <select id="fk-provider" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:inherit;margin-bottom:10px">
+            ${Object.entries(T3_PROVIDERS).map(([k,p]) => `<option value="${k}"${provider===k?' selected':''}>${esc(p.label)}</option>`).join('')}
+          </select>
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">Model</label>
+          <select id="fk-api-model" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:inherit;margin-bottom:10px">
+            ${providerCfg.models.map(m => `<option value="${m}"${(STATE.config.api_model||providerCfg.default)===m?' selected':''}>${esc(m)}</option>`).join('')}
+          </select>
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">API key</label>
+          <input type="password" id="fk-key" value="${esc(STATE.config.api_key || '')}" placeholder="${STATE.config.api_key ? '(set · leave empty to keep)' : 'sk-ant-... or sk-... or AIza...'}" autocomplete="off" style="width:100%;padding:8px 11px;background:#22212c;border:1px solid #3a342c;color:#ebe3d2;border-radius:3px;font-size:13px;font-family:ui-monospace,Menlo,monospace">
+          <div style="margin-top:8px;font-size:11px;color:#6e6a5e;line-height:1.55">Key lives in this browser only (localStorage). Sent direct to the provider — never to us. Wipe with Reset.</div>
+        </div>
+        <div style="margin-bottom:14px;padding:12px 14px;background:#1a1922;border:1px solid #2a2934;border-radius:4px">
+          <label style="display:block;font-size:11px;color:#a89e88;letter-spacing:.04em;margin-bottom:6px;text-transform:uppercase">Cross-seed mesh</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button id="fk-mesh-toggle" style="padding:6px 12px;background:${STATE.mesh.active?'#6b8d4a':'#1a1922'};color:${STATE.mesh.active?'#fff':'#a89e88'};border:1px solid ${STATE.mesh.active?'#6b8d4a':'#3a342c'};border-radius:3px;font-size:11px;cursor:pointer;font-family:inherit">${STATE.mesh.active?'✓ Active · disconnect':'Activate mesh'}</button>
+            <span style="font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#6e6a5e;letter-spacing:.04em">channel · <code style="background:#22212c;padding:1px 5px;border-radius:2px">${MESH_CHANNEL}</code></span>
+          </div>
+          <div style="margin-top:8px;font-size:11px;color:#6e6a5e;line-height:1.55">BroadcastChannel for same-device · WebRTC for cross-device (planned). Other estate seeds on the same channel discover each other automatically.</div>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+          <button onclick="FallKit.closeSettings()" style="padding:7px 14px;background:transparent;color:#a89e88;border:1px solid #3a342c;border-radius:3px;font-size:12px;cursor:pointer;font-family:inherit">Close</button>
+          <button id="fk-save" style="padding:7px 14px;background:#c08a3a;color:#0a0a0a;border:none;border-radius:3px;font-weight:600;font-size:12px;cursor:pointer;font-family:inherit">Save</button>
+        </div>
+      </div>`;
+    // Wire interactions
+    $('#fk-tier').onchange = () => {
+      const t = $('#fk-tier').value;
+      $('#fk-t2-block').style.display = t === 'T2' ? 'block' : 'none';
+      $('#fk-t3-block').style.display = t === 'T3' ? 'block' : 'none';
+    };
+    $('#fk-provider') && ($('#fk-provider').onchange = () => {
+      const p = $('#fk-provider').value;
+      const sel = $('#fk-api-model');
+      sel.innerHTML = T3_PROVIDERS[p].models.map(m => `<option value="${m}">${esc(m)}</option>`).join('');
+    });
+    $('#fk-load-llm') && ($('#fk-load-llm').onclick = () => {
+      const m = $('#fk-model').value;
+      loadWebLLM(m);
+    });
+    $('#fk-mesh-toggle').onclick = () => {
+      if (STATE.mesh.active) { STATE.mesh.bc?.close(); STATE.mesh.active = false; STATE.mesh.bc = null; notify('Mesh disconnected'); }
+      else meshStart({ seedName: STATE.config.seedName || 'seed' });
+      openSettings();  // refresh modal
+    };
+    $('#fk-save').onclick = () => {
+      STATE.config.ai_tier = $('#fk-tier').value;
+      if ($('#fk-model')) STATE.config.webllm_model = $('#fk-model').value;
+      if ($('#fk-provider')) STATE.config.api_provider = $('#fk-provider').value;
+      if ($('#fk-api-model')) STATE.config.api_model = $('#fk-api-model').value;
+      const newKey = $('#fk-key')?.value;
+      if (newKey) STATE.config.api_key = newKey;
+      saveConfig(); renderAiChip(); notify('Saved', 'ok'); closeSettings();
+    };
+  }
+  function closeSettings() { const bg = $('#fk-modal-bg'); if (bg) bg.remove(); }
+  // ─── Help section (returns HTML string for inclusion in seed Help tabs) ───
+  function helpSection() {
+    return `<div style="background:rgba(192,138,58,.05);border:1px solid #3a342c;border-radius:4px;padding:18px 22px;margin:14px 0">
+      <p style="font-size:13px;color:#a89e88;line-height:1.7;margin-bottom:10px">This seed runs fully without AI (<strong style="color:#c08a3a">T0</strong>, default). Enable a tier in settings if you want AI-assist features:</p>
+      <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+        <thead><tr><th style="padding:6px 10px;text-align:left;background:rgba(0,0,0,.2);font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#a89e88;letter-spacing:.08em;text-transform:uppercase">Tier</th><th style="padding:6px 10px;text-align:left;background:rgba(0,0,0,.2);font-family:ui-monospace,Menlo,monospace;font-size:10px;color:#a89e88;letter-spacing:.08em;text-transform:uppercase">What it is</th></tr></thead>
+        <tbody>
+          <tr><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#c08a3a;font-weight:600">T0</td><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#a89e88">Off. The seed works fully. No AI · no downloads · no API calls.</td></tr>
+          <tr><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#c08a3a;font-weight:600">T2</td><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#a89e88">WebLLM in-browser. Pick a model: 1B (700MB, fast) → 3B (2GB, balanced) → 7B (5GB, capable) → 70B (40GB, frontier). One-time download, runs offline forever after. Zero data leaves your device.</td></tr>
+          <tr><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#c08a3a;font-weight:600">T3</td><td style="padding:6px 10px;border-top:1px solid #2a2934;color:#a89e88">BYOK · Anthropic Claude · OpenAI GPT · Google Gemini. You bring the API key, you pay the provider direct. Key stays in your browser, sent direct to the provider, never proxied.</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:12px;color:#6e6a5e;line-height:1.6;margin-top:10px">Open the AI chip in the header to switch tier or check status. Cross-seed mesh activates a BroadcastChannel on <code style="background:#1a1922;padding:1px 5px;border-radius:2px">${MESH_CHANNEL}</code> so other estate seeds on the same device discover this one.</p>
+    </div>`;
+  }
+  // ─── CSS for AI chip ─────────────────────────────────────────────
+  function injectCss() {
+    const s = document.createElement('style');
+    s.id = 'fk-css';
+    s.textContent = `
+      #fk-ai-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border-radius:3px; font-family:ui-monospace,Menlo,monospace; font-size:10px; letter-spacing:.08em; text-transform:uppercase; font-weight:600; cursor:pointer; border:1px solid #3a342c; background:#1a1922; color:#a89e88; user-select:none; vertical-align:middle }
+      #fk-ai-chip:hover { border-color:#c08a3a; color:#ebe3d2 }
+      #fk-ai-chip.fk-chip-live { border-color:#6b8d4a; color:#6b8d4a; background:rgba(107,141,74,.10) }
+      #fk-ai-chip.fk-chip-loading { border-color:#e8a83a; color:#e8a83a; background:rgba(232,168,58,.10) }
+      #fk-ai-chip.fk-chip-warn { border-color:#a14a2a; color:#a14a2a; background:rgba(161,74,42,.08) }
+      #fk-ai-chip .fk-dot { width:6px; height:6px; border-radius:50%; background:currentColor; flex-shrink:0 }
+      #fk-ai-chip.fk-chip-loading .fk-dot { animation:fk-pulse 1s infinite }
+      @keyframes fk-pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+      .fk-ai-assist { display:inline-flex; align-items:center; gap:5px; padding:4px 9px; font-size:11px; border:1px solid #c08a3a; color:#c08a3a; background:transparent; border-radius:3px; cursor:pointer; font-family:inherit }
+      .fk-ai-assist:hover { background:#c08a3a; color:#0a0a0a }
+      .fk-ai-assist::before { content:'✦'; font-size:12px }
+    `;
+    document.head.appendChild(s);
+  }
+  // ─── KCC Mint launcher (v1.2 · fork-this-seed shortcut) ──────────
+  function openMint() {
+    const slug = (STATE.config.seedName || location.hostname.split('.')[0] || 'seed').replace(/[^a-z0-9-]/gi, '-').toLowerCase();
+    const url = location.href.split('?')[0].split('#')[0];
+    const params = new URLSearchParams({ fork: '1', parent_slug: slug, parent_name: name, parent_url: url, parent_desc: desc });
+  }
+  // ─── Init ────────────────────────────────────────────────────────
+  function init(opts) {
+    opts = opts || {};
+    injectCss();
+    if (opts.seedName) STATE.config.seedName = opts.seedName;
+    if ($('#fk-ai-chip')) { renderAiChip(); return { version: FALL_KIT_VERSION, mounted: false }; }
+    const chip = document.createElement('button');
+    chip.id = 'fk-ai-chip';
+    chip.title = 'AI cascade · click to configure tier and model';
+    chip.innerHTML = '<span class="fk-dot"></span><span id="fk-ai-chip-text">T0 · off</span>';
+    chip.onclick = openSettings;
+    // Try anchor first, fall back to floating bottom-right
+    const anchor = opts.chipAnchor ? $(opts.chipAnchor) : null;
+    if (anchor) { anchor.appendChild(chip); }
+    else {
+      chip.style.cssText += ';position:fixed;bottom:14px;left:14px;z-index:9998;box-shadow:0 4px 14px rgba(0,0,0,.4)';
+      document.body.appendChild(chip);
+    }
+    // v1.2 · floating mint button next to chip
+    if (!$('#fk-mint-btn') && !opts.hideMint) {
+      const mintBtn = document.createElement('button');
+      mintBtn.id = 'fk-mint-btn';
+      mintBtn.title = 'Mint a fork of this seed as a KCC bundle · provenance economy';
+      mintBtn.innerHTML = '<span style="font-size:13px">✦</span> mint fork';
+      mintBtn.style.cssText = 'position:fixed;bottom:14px;left:130px;z-index:9998;display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border-radius:3px;font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:600;cursor:pointer;border:1px solid #c08a3a;color:#c08a3a;background:rgba(10,10,15,.7);box-shadow:0 4px 14px rgba(0,0,0,.4)';
+      mintBtn.onmouseover = () => { mintBtn.style.background = '#c08a3a'; mintBtn.style.color = '#0a0a0a'; };
+      mintBtn.onmouseout  = () => { mintBtn.style.background = 'rgba(10,10,15,.7)'; mintBtn.style.color = '#c08a3a'; };
+      mintBtn.onclick = openMint;
+      document.body.appendChild(mintBtn);
+    }
+    renderAiChip();
+    return { version: FALL_KIT_VERSION, mounted: true };
+  }
+  // ─── Public API ──────────────────────────────────────────────────
+  root.FallKit = {
+    version: FALL_KIT_VERSION,
+    init: init,
+    aiTier: aiTier,
+    aiComplete: aiComplete,
+    loadWebLLM: loadWebLLM,
+    openSettings: openSettings,
+    closeSettings: closeSettings,
+    renderAiChip: renderAiChip,
+    helpSection: helpSection,
+    meshStart: meshStart,
+    meshPost: meshPost,
+    notify: notify,
+    openMint: openMint,  // v1.2 · launch kcc-mint with this seed prefilled as parent
+    MODELS: WEBLLM_MODELS,
+    PROVIDERS: T3_PROVIDERS,
+    state: STATE,
+  };
+})(typeof window !== 'undefined' ? window : globalThis);
+  // fall-kit init · auto-mounts a floating AI chip bottom-left
+  (function () {
+    function go() { if (typeof FallKit !== 'undefined') FallKit.init({ seedName: "fallseed-ifa" }); }
+    else go();
+  })();
+'use strict';
+// ═══════════════════════════════════════════════════════════════
+// THE SEED · executable build-capacity for an HR firm
+// ═══════════════════════════════════════════════════════════════
+const SEED_DEFAULT = {
+ manifest: {
+ name: 'ifa-firm', vertical: 'IFA · financial planning · investments', version: '2.0.0', prime: 1031,
+    level: 0,
+    parent: "fallseed-hr",
+ primeWindow: [719, 727, 733, 739],
+ bundleRoles: ['anchor', 'onboard', 'paper', 'practice'],
+ meshChannel: 'fall-ifa',
+ bloomVector: [3, 5, 4, 2, 3, 1, 1],
+ foldSequence: '●〜┃♡',
+ },
+ baseTools: [
+ { role: 'anchor', name: 'falladviser-v2', prime: 719, url: 'https://sjgant80-hub.github.io/falladviser-v2/'
+,
+ purpose: 'Client register · risk profile · suitability reports · KYC · vulnerable-customer flags · FCA-aligned recordkeeping' },
+ { role: 'onboard', name: 'fallonboard', prime: 727, url: 'https://sjgant80-hub.github.io/fallonboard/'
+,
+ purpose: 'Client onboarding wizard · ID & verification · objectives · fact-find · risk questionnaire · KYC · consent capture' },
+ { role: 'paper', name: 'fallpaper', prime: 733, url: 'https://sjgant80-hub.github.io/fallpaper/'
+,
+ purpose: 'Suitability letters · CIDD · KFI/illustrations · annual review packs · Consumer Duty fair-value templates' },
+ { role: 'practice', name: 'fallpractice', prime: 739, url: 'https://sjgant80-hub.github.io/fallpractice/'
+,
+ purpose: 'Pipeline · ongoing servicing · MIFAR / Consumer Duty monitoring · breach log · file reviews · FOS / FSCS tracker' }
+ ],
+ t0Rules: [
+ { pattern: 'consumer duty|prin 12|fair value', answer: 'FCA Consumer Duty (PRIN 12): four outcomes — products & services, price & value, consumer understanding, consumer support. Cross-cutting rules: act in good faith, avoid foreseeable harm, enable customers to pursue their objectives. Open products since 31 Jul 2023; closed since 31 Jul 2024. Board champion required; annual Consumer Duty board report.' },
+ { pattern: 'suitab|cobs 9|reasons.?why', answer: 'Suitability (COBS 9): collect facts (objectives, financial situation, knowledge & experience, risk tolerance & capacity) → assess → provide suitability report. Reasons-why letter mandatory. Annual review for ongoing-service clients.' },
+ { pattern: 'cass|client (money|asset)|cmar', answer: 'CASS: client money & assets segregated. Daily reconciliation. CMAR returns. CASS audit annually. CF10a / SMF18 oversight.' },
+ { pattern: 'isa', answer: 'ISA: £20,000 annual allowance (2025/26). Cash · Stocks & Shares · LISA · JISA. Flexible ISA rules: withdraw and replace within same tax year. LISA £4k counts within £20k. JISA £9k separate.' },
+ { pattern: 'sipp|pension allowance', answer: 'SIPP / pension: £60,000 annual allowance (tapered for adjusted income > £260k, min £10k). Lifetime allowance abolished 6 Apr 2024 (LSA £268,275 / LSDBA £1,073,100 caps). MPAA £10,000 if flexibly accessed. Carry-forward 3 prior tax years.' },
+ { pattern: 'lisa|lifetime isa', answer: 'LISA: £4,000/year, 25% gov bonus. 25% withdrawal penalty unless first home purchase (≤£450,000) or aged 60+. Open age 18-39.' },
+ { pattern: 'vulnerab|fg21|fg21/1', answer: 'FG21/1 vulnerable customers: identify drivers (health, life events, capability, resilience). Adapt service. Train staff. Record clearly. Outcome monitoring required under Consumer Duty.' },
+ { pattern: 'fscs|protection', answer: 'FSCS: deposit £85,000 per institution. Investment £85,000. Insurance 100% no cap for long-term / compulsory. Pension provider £85k (or 100% if SIPP wrapper holds protected assets).' },
+ { pattern: 'fos|ombud|threshold', answer: 'FOS: free to consumer. Award threshold £430,000 for acts after 1 Apr 2025 (£430k from Apr 2025; £415k from Apr 2024). Firm must issue final response within 8 weeks (15 business days for payment services). Award is binding if accepted.' },
+ { pattern: 'pension transfer|safeguarded|pts', answer: 'Pension transfer specialist (PTS) qualification required for advice on transfers of safeguarded benefits (DB / GMP / with-profits). Independent advice mandatory for transfers > £30,000 (Pension Schemes Act 2015 s.48). APTA + TVC required since 1 Oct 2018.' },
+ { pattern: 'mifid|mifid ii|costs.?charges', answer: 'MiFID II: ex-ante and ex-post costs & charges disclosure. 10% drop reporting for portfolio MIFIDPRU firms. Best execution evidence.' },
+ { pattern: 'sm&cr|smf|conduct rules', answer: 'SM&CR: Senior Managers Functions (SMFs), Certification Regime for material-risk takers, Conduct Rules for nearly all staff. Annual fitness & propriety. Statements of Responsibilities for SMFs.' }
+ ],
+ complianceItems: [
+ 'FCA authorisation in place (Part 4A permissions)',
+ 'Consumer Duty board champion + annual report — PRIN 12',
+ 'Suitability reports issued on every recommendation — COBS 9',
+ 'Annual reviews delivered to ongoing-service clients',
+ 'CASS reconciliation daily; CMAR submitted — CASS 6 / 7',
+ 'PII in force (min cover per FCA scale)',
+ 'Vulnerable customer policy + training — FG21/1',
+ 'Fee disclosure: ex-ante + ex-post — MiFID II / Consumer Duty fair-value',
+ 'Pension transfer specialist (PTS) on file (if DB/safeguarded)',
+ 'SM&CR Statements of Responsibilities up to date',
+ 'Privacy notice + Art.13 disclosures — UK GDPR',
+ 'AML CDD on every client — MLR 2017',
+ 'Complaints procedure + DISP returns submitted',
+ 'FOS / FSCS disclosures in client packs'
+ ],
+ documentClauses: [
+ { code: 'SUITABILITY-OPEN', text: 'This suitability report is provided under COBS 9 and explains why the recommended product or strategy is suitable for your objectives, financial situation, knowledge and experience, and your willingness and ability to take risk.' },
+ { code: 'CONSUMER-DUTY', text: 'This document complies with FCA Consumer Duty (PRIN 12): products & services, price & value, consumer understanding, consumer support.' },
+ { code: 'FOS-FSCS', text: 'If you are unhappy with our service you may complain. If unresolved within 8 weeks you may refer the complaint to the Financial Ombudsman Service. We are covered by the Financial Services Compensation Scheme.' },
+ { code: 'PENSION-TRANSFER', text: 'Transferring out of a defined benefit pension is unlikely to be in your best interests. Independent advice from a Pension Transfer Specialist is mandatory for transfers exceeding £30,000 (Pension Schemes Act 2015 s.48).' },
+ { code: 'GDPR-NOTICE', text: 'Personal data is processed for the provision of financial advice. Lawful basis: contract Art.6(1)(b) and legitimate interest Art.6(1)(f); special-category data on explicit consent Art.9(2)(a). Retention: 6 years after end of advice relationship (15 for pensions / life).' }
+ ],
+ buildPromptSystem: `You are FallSeed-Build, the generative substrate of the FallSeed IFA wedge.
+You generate sovereign single-HTML tools that extend a IFA wedge for a UK SME. Every tool you produce MUST:
+1. Be a COMPLETE single HTML file starting with <!DOCTYPE html> and ending with <\/html>.
+2. Include all CSS inline using the FallSeed dark palette: --void #0b0a0f, --brass #b8974a, --amber #ff8c00, --cream #e6e1d6.
+3. Include all JavaScript inline. Use 'use strict'. Any literal close-script tag in a string MUST be written as <\/script>.
+4. Store data in IndexedDB keyed by the tool name. Use auto-increment integer ids.
+5. Open a BroadcastChannel named 'fall-ifa' for mesh sync with the existing IFA wedge.
+6. Broadcast 'hello' to 'fall-signal' channel on boot with {source, type:'hello', prime, version}.
+7. Include a P3 audit chain: prevHash + SHA-256 chained entries on every state mutation.
+8. Include a T0 Q&A panel that pattern-matches user questions against hard-coded UK IFA rules.
+9. Include a seedDemo() function that populates 2-3 sample records on first boot (isDemo:true flag).
+10. Have at least 3 tabs: a main list view, a settings panel with Export/Import/Wipe, and a Q&A panel.
+11. Include a modal pattern for add/edit forms.
+12. Use the same CSS class names as the rest of the wedge: nav.tabs, .card, .btn, .btn.brass, .btn.sm, .toast, .modal-bg, .modal, .field, .row.
+13. Include a regulatory disclaimer at the top of the main view referencing the specific UK Acts/Regs.
+14. Include a manifest data: URL for PWA installability.
+15. Set <meta name="prime" content="XXXX"> where XXXX is a prime > 1031 not already used in the wedge.
+16. Name the tool with prefix 'falladv' (e.g. falladvkyc, falladvfact, falladvreview). Lowercase no-space single-word suffix.
+When the user describes a tool they need, output ONLY the complete HTML file. No preamble, no markdown code fences. Start with <!DOCTYPE html> and end with <\/html>.`
+};
+// In v2 SEED is mutable — the user can fork it via the Packager tab
+let SEED = JSON.parse(JSON.stringify(SEED_DEFAULT));
+// ═══════════════════════════════════════════════════════════════
+// PROVIDERS · LLM-agnostic cascade with streaming
+// ═══════════════════════════════════════════════════════════════
+const PROVIDERS = [
+ { id: 'webllm', name: 'WebLLM', tier: 'T1', tierLabel: 'sovereign', priority: 1,
+ model: 'Llama-3.2-3B-Instruct-q4f16_1-MLC', defaultEnabled: false, supportsStream: true,
+ pricePer1MIn: 0, pricePer1MOut: 0,
+ note: 'In-browser via WebGPU. First load ~2GB. Free, offline, no key.' },
+ { id: 'ollama', name: 'Ollama (local)', tier: 'T2', tierLabel: 'sovereign', priority: 2,
+ endpoint: 'http://localhost:11434/v1/chat/completions', model: 'llama3.2', defaultEnabled: true, supportsStream: true,
+ pricePer1MIn: 0, pricePer1MOut: 0,
+ note: 'localhost:11434 · install ollama · OLLAMA_ORIGINS=* for CORS' },
+ { id: 'lmstudio', name: 'LM Studio (local)',tier: 'T2', tierLabel: 'sovereign', priority: 3,
+ endpoint: 'http://localhost:1234/v1/chat/completions', model: 'loaded', defaultEnabled: true, supportsStream: true,
+ pricePer1MIn: 0, pricePer1MOut: 0,
+ note: 'localhost:1234 · loads any GGUF · enable CORS in Server tab' },
+ { id: 'groq', name: 'Groq', tier: 'T3-free', tierLabel: 'free', priority: 4,
+ endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+ model: 'llama-3.3-70b-versatile', requiresKey: true, freeTier: true, defaultEnabled: true, supportsStream: true,
+ pricePer1MIn: 0, pricePer1MOut: 0,
+ signupUrl: 'https://console.groq.com/keys',
+ note: '30 req/min · 14k tokens/min · Llama 3.3 70B · fastest cloud' },
+ { id: 'openrouter-free', name: 'OpenRouter free', tier: 'T3-free', tierLabel: 'free', priority: 5,
+ endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+ model: 'meta-llama/llama-3.3-70b-instruct:free', requiresKey: true, freeTier: true, defaultEnabled: true, supportsStream: true,
+ pricePer1MIn: 0, pricePer1MOut: 0,
+ signupUrl: 'https://openrouter.ai/keys',
+ note: 'Free: Llama 3.3 70B, Gemini 2.0 Flash, Mistral · 200 req/day' },
+ { id: 'google', name: 'Google AI Studio', tier: 'T3-free', tierLabel: 'free', priority: 6,
+ endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent',
+ model: 'gemini-2.5-flash', requiresKey: true, freeTier: true, defaultEnabled: true, supportsStream: true,
+ pricePer1MIn: 0, pricePer1MOut: 0,
+ signupUrl: 'https://aistudio.google.com/apikey',
+ note: 'Gemini 2.5 Flash free · 15 req/min · 1M tokens/day free' },
+ { id: 'cerebras', name: 'Cerebras', tier: 'T3-free', tierLabel: 'free', priority: 7,
+ endpoint: 'https://api.cerebras.ai/v1/chat/completions',
+ model: 'llama-3.3-70b', requiresKey: true, freeTier: true, defaultEnabled: true, supportsStream: true,
+ pricePer1MIn: 0, pricePer1MOut: 0,
+ signupUrl: 'https://cloud.cerebras.ai/platform',
+ note: 'Llama 3.3 70B at ~2200 tokens/sec · generous free tier' },
+ { id: 'anthropic', name: 'Anthropic (paid)', tier: 'T3-paid', tierLabel: 'paid', priority: 8,
+ endpoint: 'https://api.anthropic.com/v1/messages',
+ model: 'claude-sonnet-4-20250514', requiresKey: true, paid: true, defaultEnabled: false, supportsStream: true,
+ pricePer1MIn: 3, pricePer1MOut: 15,
+ signupUrl: 'https://console.anthropic.com/',
+ note: 'Sonnet 4: ~£0.03/tool · highest quality codegen' }
+];
+// ═══════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════
+const TABS = [
+ { id: 'welcome', label: 'Welcome' },
+ { id: 'install', label: 'Install' },
+ { id: 'build', label: 'Build' },
+ { id: 'providers', label: 'LLM Providers' },
+ { id: 'packager', label: 'Fork Seed' },
+ { id: 'inspect', label: 'Inspect' },
+ { id: 'settings', label: 'Settings' }
+];
+let state = {
+ active: 'welcome',
+ firm: null,
+ providerConfig: {},
+ rateLimits: {},
+ usage: {},
+ generated: [],
+ webllmEngine: null,
+ webllmStatus: 'unloaded',
+ autoDetected: [],
+ pkgDraft: null
+};
+const $ = (s, p = document) => p.querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+const uid = p => (p || '') + '_' + Math.random().toString(36).slice(2, 11);
+const now = () => Date.now();
+function toast(m) {
+ const t = $('#toast'); t.textContent = m; t.classList.add('show');
+ clearTimeout(t._to); t._to = setTimeout(() => t.classList.remove('show'), 2200);
+}
+function openModal(title, body) {
+ $('#modalTitle').textContent = title;
+ $('#modalBody').innerHTML = body;
+ $('#modal').classList.add('open');
+}
+function closeModal() { $('#modal').classList.remove('open'); }
+let db;
+function openDB() {
+ return new Promise((res, rej) => {
+ const r = indexedDB.open('fallseed-ifa-v2', 1);
+ r.onupgradeneeded = e => {
+ const d = e.target.result;
+ if (!d.objectStoreNames.contains('config')) d.createObjectStore('config');
+ if (!d.objectStoreNames.contains('generated')) d.createObjectStore('generated', { keyPath: 'id' });
+ };
+ r.onsuccess = e => { db = e.target.result; res(db); };
+ r.onerror = rej;
+ });
+}
+function idbGet(s, k) { return new Promise(r => { const tx = db.transaction(s,'readonly'); const q = tx.objectStore(s).get(k); q.onsuccess = () => r(q.result); }); }
+function idbGetAll(s) { return new Promise(r => { const tx = db.transaction(s,'readonly'); const q = tx.objectStore(s).getAll(); q.onsuccess = () => r(q.result||[]); }); }
+function idbPut(s, v, k) { return new Promise(r => { const tx = db.transaction(s,'readwrite'); const o = tx.objectStore(s); const q = k != null ? o.put(v, k) : o.put(v); q.onsuccess = () => r(true); }); }
+async function loadAll() {
+  await __loadStoredFlavour && __loadStoredFlavour();
+ if (!db) await openDB();
+ state.firm = await idbGet('config', 'firm');
+ state.providerConfig = await idbGet('config', 'providerConfig') || {};
+ state.rateLimits = await idbGet('config', 'rateLimits') || {};
+ state.usage = await idbGet('config', 'usage') || {};
+ state.generated = await idbGetAll('generated');
+ const savedSeed = await idbGet('config', 'forkedSeed');
+ if (savedSeed) SEED = savedSeed;
+ for (const p of PROVIDERS) {
+ if (!(p.id in state.providerConfig)) {
+ state.providerConfig[p.id] = { enabled: p.defaultEnabled, key: '', customModel: '' };
+ }
+ if (!(p.id in state.usage)) state.usage[p.id] = { totalIn: 0, totalOut: 0, calls: 0, lastUsed: 0 };
+ }
+ await idbPut('config', state.providerConfig, 'providerConfig');
+}
+async function persistProviderConfig() { await idbPut('config', state.providerConfig, 'providerConfig'); }
+async function persistRateLimits() { await idbPut('config', state.rateLimits, 'rateLimits'); }
+async function persistUsage() { await idbPut('config', state.usage, 'usage'); }
+// ═══════════════════════════════════════════════════════════════
+// MESH · upgraded · peer tracker on fall-signal · 2026-06-21
+// ═══════════════════════════════════════════════════════════════
+window.__fellowSeeds = window.__fellowSeeds || new Map();
+let __sigChan = null, __meshChan2 = null, __pingTimer = null;
+function __seedSelfInfo() {
+  try {
+    return {
+      source: 'fallseed-' + (SEED.manifest.name || 'unknown'),
+      name: SEED.manifest.name || 'unknown',
+      prime: SEED.manifest.prime,
+      version: SEED.manifest.version,
+      level: SEED.manifest.level !== undefined ? SEED.manifest.level : null,
+      parent: SEED.manifest.parent || null,
+      mesh: SEED.manifest.meshChannel,
+      ts: Date.now()
+    };
+  } catch (e) { return { source: 'fallseed-unknown', ts: Date.now() }; }
+}
+function __pruneFellowSeeds(maxAgeMs) {
+  const cutoff = Date.now() - (maxAgeMs || 90000);
+  for (const [k, v] of window.__fellowSeeds.entries()) {
+    if (v.lastSeen < cutoff) window.__fellowSeeds.delete(k);
+  }
+}
+function initMesh() {
+  try {
+    __sigChan = new BroadcastChannel('fall-signal');
+    // Announce self
+    __sigChan.postMessage({ type: 'hello', ...__seedSelfInfo() });
+    // Listen for hellos + pings + replies
+    __sigChan.onmessage = e => {
+      const m = e.data || {};
+      if (!m.type) return;
+      if (m.type === 'hello' || m.type === 'pong') {
+        if (!m.source || m.source === __seedSelfInfo().source) return;
+        const existing = window.__fellowSeeds.get(m.source) || {};
+        window.__fellowSeeds.set(m.source, { ...existing, ...m, lastSeen: Date.now() });
+        // Trigger a re-render of inspect if visible
+        if (typeof state !== 'undefined' && state.active === 'inspect') {
+          if (typeof render === 'function') try { render(); } catch (e) {}
+        }
+      } else if (m.type === 'ping') {
+        // Reply with our own info so the pinger can discover us
+        try { __sigChan.postMessage({ type: 'pong', ...__seedSelfInfo() }); } catch (e) {}
+      }
+    };
+    // Periodic ping to refresh peer list (every 30s)
+    __pingTimer = setInterval(() => {
+      try {
+        __sigChan.postMessage({ type: 'ping', ...__seedSelfInfo() });
+        __pruneFellowSeeds(90000);
+      } catch (e) {}
+    }, 30000);
+    // Also try a vertical mesh channel if SEED defines one
+    try {
+      const mc = SEED.manifest.meshChannel;
+      if (mc && mc !== 'fall-signal') {
+        __meshChan2 = new BroadcastChannel(mc);
+      }
+    } catch (e) {}
+    try { __wireCrossSeed(); } catch(_e){}
+  } catch (e) { /* mesh optional */ }
+}
+// ─── Cross-seed mesh protocol (request/response) · 2026-06-21 ───
+window.__crossSeedHandlers = window.__crossSeedHandlers || {};
+window.__crossSeedPending  = window.__crossSeedPending  || new Map();
+// Default introspect handler — every seed can describe itself
+window.__crossSeedHandlers['introspect'] = async function() {
+  return {
+    manifest: SEED.manifest,
+    peerCount: window.__fellowSeeds?.size || 0,
+    ts: Date.now()
+  };
+};
+// Default records-export handler — list all entries from named IDB stores
+window.__crossSeedHandlers['records-export'] = async function(payload) {
+  const stores = (payload?.stores || []).filter(s => typeof s === 'string');
+  const out = {};
+  for (const s of stores) {
+    try { out[s] = await idbGetAll(s); } catch(e) { out[s] = { error: e.message }; }
+  }
+  return { records: out, manifest: SEED.manifest, ts: Date.now() };
+};
+// Intercept fall-signal messages for request/response routing
+// (extends __sigChan listener set up by initMesh)
+function __wireCrossSeed() {
+  if (!__sigChan) return;
+  const origOnMsg = __sigChan.onmessage;
+  __sigChan.onmessage = async (e) => {
+    if (origOnMsg) try { origOnMsg(e); } catch(err) {}
+    const m = e.data || {};
+    if (!m.type) return;
+    const self = __seedSelfInfo().source;
+    if (m.type === 'request' && (m.to === self || m.to === '*') && m.from !== self) {
+      const handler = window.__crossSeedHandlers[m.kind];
+      if (!handler) return;
+      try {
+        const result = await handler(m.payload || {});
+        __sigChan.postMessage({ type:'response', kind:m.kind, from:self, to:m.from, payload:result, reqId:m.reqId });
+      } catch (err) {
+        __sigChan.postMessage({ type:'response', kind:m.kind, from:self, to:m.from, payload:{ error: err.message }, reqId:m.reqId });
+      }
+    } else if (m.type === 'response' && m.to === self) {
+      const pending = window.__crossSeedPending.get(m.reqId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pending.resolve(m.payload);
+        window.__crossSeedPending.delete(m.reqId);
+      }
+    }
+  };
+}
+// Send a request to a specific peer (or all '*') and await response(s)
+async function crossSeedRequest(targetSource, kind, payload, opts) {
+  opts = opts || {};
+  const timeoutMs = opts.timeoutMs || 3000;
+  const reqId = 'r_' + Math.random().toString(36).slice(2,12);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      window.__crossSeedPending.delete(reqId);
+      reject(new Error('timeout'));
+    }, timeoutMs);
+    window.__crossSeedPending.set(reqId, { resolve, reject, timer });
+    try {
+      __sigChan.postMessage({
+        type:'request', kind, from:__seedSelfInfo().source,
+        to:targetSource, payload, reqId
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      window.__crossSeedPending.delete(reqId);
+      reject(e);
+    }
+  });
+}
+// ─── Flavour pull from fallrecall (2026-06-21) ──────────
+window.__flavourProfile = null;
+window.__flavourLoadedAt = null;
+async function pullFlavourFromRecall() {
+  try {
+    if (typeof crossSeedRequest !== 'function') { toast('mesh not ready · refresh + try again', true); return; }
+    toast('asking fallrecall for your flavour…');
+    const resp = await crossSeedRequest('fallrecall', 'flavour-summary', {}, { timeoutMs: 4000 });
+    if (!resp) { toast('no reply from fallrecall', true); return; }
+    if (!resp.available) { toast('fallrecall has no profile yet · analyse some conversations there first', true); return; }
+    window.__flavourProfile = resp.profile;
+    window.__flavourShortPrompt = resp.shortPrompt || null;
+    window.__flavourLoadedAt = Date.now();
+    try { await idbPut('config', { profile: resp.profile, shortPrompt: resp.shortPrompt, loadedAt: window.__flavourLoadedAt }, 'flavour'); } catch(e) {}
+    toast('✓ flavour pulled · ' + (resp.profile?.voiceNotes?.length||0) + ' voice notes loaded');
+    if (typeof render === 'function') render();
+  } catch (e) {
+    if (e.message === 'timeout') toast('fallrecall not detected on this origin · open it in another tab first', true);
+    else toast('pull failed: ' + e.message, true);
+  }
+}
+async function __loadStoredFlavour() {
+  try {
+    const stored = await idbGet('config', 'flavour');
+    if (stored) {
+      window.__flavourProfile = stored.profile;
+      window.__flavourShortPrompt = stored.shortPrompt;
+      window.__flavourLoadedAt = stored.loadedAt;
+    }
+  } catch(e) {}
+}
+// ═══════════════════════════════════════════════════════════════
+// V2 · AUTO-DETECT LOCAL RUNNERS ON BOOT
+// ═══════════════════════════════════════════════════════════════
+async function autoDetectProviders() {
+ state.autoDetected = [];
+ for (const p of PROVIDERS.filter(p => p.tier === 'T2')) {
+ const reachable = await detectLocalRunner(p.endpoint);
+ if (reachable) {
+ state.autoDetected.push(p.id);
+ if (!state.providerConfig[p.id].userToggled) {
+ state.providerConfig[p.id].enabled = true;
+ }
+ }
+ }
+ await persistProviderConfig();
+}
+async function detectLocalRunner(endpoint) {
+ try {
+ const versionEp = endpoint.replace('/v1/chat/completions', endpoint.includes('11434') ? '/api/version' : '/v1/models');
+ const r = await Promise.race([
+ fetch(versionEp, { method: 'GET' }),
+ new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1500))
+ ]);
+ return r.ok;
+ } catch (e) {
+ return false;
+ }
+}
+async function providerAvailable(p) {
+ const cfg = state.providerConfig[p.id] || {};
+ if (!cfg.enabled) return { ok: false, reason: 'disabled' };
+ if (p.requiresKey && !cfg.key) return { ok: false, reason: 'no key' };
+ const rl = state.rateLimits[p.id];
+ if (rl && rl.until > now()) return { ok: false, reason: 'rate-limited until ' + new Date(rl.until).toLocaleTimeString('en-GB') };
+ if (p.tier === 'T2') {
+ const reachable = await detectLocalRunner(p.endpoint);
+ if (!reachable) return { ok: false, reason: 'not running on ' + p.endpoint.match(/localhost:\d+/)[0] };
+ }
+ if (p.id === 'webllm') {
+ if (!navigator.gpu) return { ok: false, reason: 'WebGPU not available' };
+ }
+ return { ok: true };
+}
+// ═══════════════════════════════════════════════════════════════
+// V2 · STREAMING PROVIDER ADAPTERS
+// ═══════════════════════════════════════════════════════════════
+async function callProviderStream(p, system, user, maxTokens, onToken, onProgress) {
+ const cfg = state.providerConfig[p.id] || {};
+ const model = cfg.customModel || p.model;
+ if (p.id === 'webllm') return await callWebLLMStream(model, system, user, maxTokens, onToken, onProgress);
+ if (p.id === 'anthropic') return await callAnthropicStream(p, cfg.key, model, system, user, maxTokens, onToken);
+ if (p.id === 'google') return await callGoogleStream(p, cfg.key, model, system, user, maxTokens, onToken);
+ return await callOpenAICompatStream(p, cfg.key, model, system, user, maxTokens, onToken);
+}
+async function readSSE(reader, onLine) {
+ const decoder = new TextDecoder();
+ let buf = '';
+ while (true) {
+ const { done, value } = await reader.read();
+ if (done) break;
+ buf += decoder.decode(value, { stream: true });
+ const lines = buf.split('\n');
+ buf = lines.pop() || '';
+ for (const line of lines) {
+ const trimmed = line.trim();
+ if (trimmed.startsWith('data: ')) {
+ const payload = trimmed.slice(6);
+ if (payload === '[DONE]') return;
+ try { onLine(JSON.parse(payload)); } catch (e) {}
+ }
+ }
+ }
+}
+async function callOpenAICompatStream(p, key, model, system, user, maxTokens, onToken) {
+ const headers = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
+ if (key) headers['Authorization'] = 'Bearer ' + key;
+ if (p.id === 'openrouter-free') {
+ headers['HTTP-Referer'] = 'https://sjgant80-hub.github.io/';
+ headers['X-Title'] = 'FallSeed';
+ }
+ const resp = await fetch(p.endpoint, {
+ method: 'POST', headers,
+ body: JSON.stringify({
+ model, stream: true,
+ messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+ max_tokens: maxTokens, temperature: 0.3
+ })
+ });
+ if (resp.status === 429) {
+ const retryAfter = parseInt(resp.headers.get('retry-after') || '60', 10);
+ state.rateLimits[p.id] = { until: now() + retryAfter * 1000, ts: now() };
+ await persistRateLimits();
+ throw new Error('rate-limited (retry after ' + retryAfter + 's)');
+ }
+ if (!resp.ok) { const t = await resp.text(); throw new Error(p.name + ' ' + resp.status + ': ' + t.slice(0,200)); }
+ let text = '', tokensIn = 0, tokensOut = 0;
+ await readSSE(resp.body.getReader(), (data) => {
+ const delta = data.choices?.[0]?.delta?.content || '';
+ if (delta) { text += delta; onToken(text); }
+ if (data.usage) { tokensIn = data.usage.prompt_tokens || tokensIn; tokensOut = data.usage.completion_tokens || tokensOut; }
+ });
+ if (!tokensOut) tokensOut = Math.ceil(text.length / 4);
+ return { text, tokensIn, tokensOut, model };
+}
+async function callAnthropicStream(p, key, model, system, user, maxTokens, onToken) {
+ const resp = await fetch(p.endpoint, {
+ method: 'POST',
+ headers: {
+ 'x-api-key': key, 'anthropic-version': '2023-06-01',
+ 'content-type': 'application/json',
+ 'anthropic-dangerous-direct-browser-access': 'true'
+ },
+ body: JSON.stringify({ model, max_tokens: maxTokens, system, stream: true,
+ messages: [{ role: 'user', content: user }] })
+ });
+ if (resp.status === 429) {
+ state.rateLimits[p.id] = { until: now() + 60000, ts: now() };
+ await persistRateLimits();
+ throw new Error('rate-limited');
+ }
+ if (!resp.ok) { const t = await resp.text(); throw new Error('Anthropic ' + resp.status + ': ' + t.slice(0,200)); }
+ let text = '', tokensIn = 0, tokensOut = 0;
+ await readSSE(resp.body.getReader(), (data) => {
+ if (data.type === 'content_block_delta' && data.delta?.text) {
+ text += data.delta.text; onToken(text);
+ }
+ if (data.type === 'message_start' && data.message?.usage) tokensIn = data.message.usage.input_tokens || 0;
+ if (data.type === 'message_delta' && data.usage) tokensOut = data.usage.output_tokens || tokensOut;
+ });
+ return { text, tokensIn, tokensOut, model };
+}
+async function callGoogleStream(p, key, model, system, user, maxTokens, onToken) {
+ const endpoint = p.endpoint + '?key=' + encodeURIComponent(key) + '&alt=sse';
+ const resp = await fetch(endpoint, {
+ method: 'POST', headers: { 'Content-Type': 'application/json' },
+ body: JSON.stringify({
+ contents: [{ role: 'user', parts: [{ text: user }] }],
+ systemInstruction: { parts: [{ text: system }] },
+ generationConfig: { maxOutputTokens: maxTokens, temperature: 0.3 }
+ })
+ });
+ if (resp.status === 429) {
+ state.rateLimits[p.id] = { until: now() + 60000, ts: now() };
+ await persistRateLimits();
+ throw new Error('rate-limited');
+ }
+ if (!resp.ok) { const t = await resp.text(); throw new Error('Google ' + resp.status + ': ' + t.slice(0,200)); }
+ let text = '', tokensIn = 0, tokensOut = 0;
+ await readSSE(resp.body.getReader(), (data) => {
+ const part = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+ if (part) { text += part; onToken(text); }
+ if (data.usageMetadata) {
+ tokensIn = data.usageMetadata.promptTokenCount || tokensIn;
+ tokensOut = data.usageMetadata.candidatesTokenCount || tokensOut;
+ }
+ });
+ return { text, tokensIn, tokensOut, model };
+}
+async function callWebLLMStream(model, system, user, maxTokens, onToken, onProgress) {
+ if (!state.webllmEngine) {
+ onProgress && onProgress('webllm', 'loading model ' + model + ' (~2GB first time)...');
+ state.webllmStatus = 'loading';
+ const webllm = await import('https://esm.run/@mlc-ai/web-llm');
+ state.webllmEngine = await webllm.CreateMLCEngine(model, {
+ initProgressCallback: pr => onProgress && onProgress('webllm', pr.text || 'loading...')
+ });
+ state.webllmStatus = 'ready';
+ }
+ const reply = await state.webllmEngine.chat.completions.create({
+ messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+ max_tokens: maxTokens, temperature: 0.3, stream: true
+ });
+ let text = '', tokensOut = 0;
+ for await (const chunk of reply) {
+ const delta = chunk.choices?.[0]?.delta?.content || '';
+ if (delta) { text += delta; onToken(text); tokensOut++; }
+ }
+ return { text, tokensIn: Math.ceil((system.length+user.length)/4), tokensOut, model };
+}
+// ═══════════════════════════════════════════════════════════════
+// V2 · CASCADE WITH STREAMING
+// ═══════════════════════════════════════════════════════════════
+async function runCascadeStream(system, user, maxTokens, onToken, onTrace) {
+ const sorted = PROVIDERS.slice().sort((a, b) => a.priority - b.priority);
+ const trace = [];
+ for (const p of sorted) {
+ const t0 = now();
+ const avail = await providerAvailable(p);
+ if (!avail.ok) {
+ trace.push({ provider: p.name, status: 'skip', reason: avail.reason, ms: 0 });
+ onTrace && onTrace(trace);
+ continue;
+ }
+ trace.push({ provider: p.name, status: 'try', reason: 'connecting...', ms: 0 });
+ onTrace && onTrace(trace);
+ try {
+ const result = await callProviderStream(p, system, user, maxTokens, onToken, (pid, msg) => {
+ trace[trace.length - 1].reason = msg;
+ onTrace && onTrace(trace);
+ });
+ trace[trace.length - 1].status = 'ok';
+ trace[trace.length - 1].reason = `${result.tokensIn}→${result.tokensOut} tokens · ${result.model}`;
+ trace[trace.length - 1].ms = now() - t0;
+ onTrace && onTrace(trace);
+ // V2 · update usage tracker
+ state.usage[p.id].totalIn += result.tokensIn;
+ state.usage[p.id].totalOut += result.tokensOut;
+ state.usage[p.id].calls += 1;
+ state.usage[p.id].lastUsed = now();
+ await persistUsage();
+ return { ...result, provider: p, trace };
+ } catch (e) {
+ trace[trace.length - 1].status = 'fail';
+ trace[trace.length - 1].reason = e.message.slice(0, 100);
+ trace[trace.length - 1].ms = now() - t0;
+ onTrace && onTrace(trace);
+ }
+ }
+ throw new Error('All providers failed or unavailable. Configure at least one in LLM Providers tab.');
+}
+// ═══════════════════════════════════════════════════════════════
+// RENDER
+// ═══════════════════════════════════════════════════════════════
+function render() {
+ $('#tabNav').innerHTML = TABS.map(t => `<button class="${state.active===t.id?'active':''}" onclick="switchTab('${t.id}')">${t.label}</button>`).join('');
+ updateTierBadge();
+ const v = $('#view');
+ switch (state.active) {
+ case 'welcome': return renderWelcome(v);
+ case 'install': return renderInstall(v);
+ case 'build': return renderBuild(v);
+ case 'providers': return renderProviders(v);
+ case 'packager': return renderPackager(v);
+ case 'inspect': return renderInspect(v);
+ case 'settings': return renderSettings(v);
+ }
+}
+function switchTab(id) { state.active = id; render(); }
+function updateTierBadge() {
+ const enabled = PROVIDERS.filter(p => state.providerConfig[p.id]?.enabled && (!p.requiresKey || state.providerConfig[p.id]?.key));
+ const badge = $('#tierBadge');
+ if (!enabled.length) badge.textContent = 'NO LLM';
+ else {
+ const tiers = new Set(enabled.map(p => p.tierLabel));
+ badge.textContent = enabled.length + ' READY · ' + Array.from(tiers).join('/');
+ }
+}
+function renderWelcome(v) {
+ const totalTokens = Object.values(state.usage).reduce((s,u) => s+u.totalIn+u.totalOut, 0);
+ const totalCalls = Object.values(state.usage).reduce((s,u) => s+u.calls, 0);
+ v.innerHTML = `
+ <div class="hero">
+ <h1>FallSeed · HR Firm <span class="v-badge">PWA</span></h1>
+ <div class="lede">A <strong>Progressive Web App</strong> for UK HR firms. <strong>One HTML file</strong> — runs in any modern browser, installs to desktop and phone, works offline. Ships with four working HR tools plus a <strong>build engine</strong> that generates new tools on demand using any LLM you like (WebLLM in your browser, ollama on your laptop, free cloud tiers, or your own paid API key). And a <strong>Fork Seed</strong> mechanic that turns this HR template into a seed for any vertical — clinic, vet, recruit, construction — in 5 minutes.</div>
+ <div style="margin-top:14px;padding:10px 14px;background:rgba(74,222,128,0.08);border-left:3px solid var(--green);border-radius:3px;font-size:12px;color:var(--cream-dim);line-height:1.6">
+ <strong style="color:var(--green)">📱 Install as a PWA:</strong> Chrome menu → "Install FallSeed" (desktop or mobile). You get a desktop icon, your own window, full offline support. No app store. No tracking. The whole product is the page you're looking at.
+ </div>
+ </div>
+ <div class="section-h"><h2>What's new in v2</h2></div>
+ <div class="card">
+ <div class="flow-step"><div class="n">1</div><div class="body"><b>Streaming generation</b><span>Tokens appear in the iframe as Claude/Llama writes them. The HTML literally renders progressively. Watch a tool being built in real time. Massive perception upgrade vs spinner.</span></div></div>
+ <div class="flow-step"><div class="n">2</div><div class="body"><b>Auto-detect local runners</b><span>On boot, the installer probes localhost:11434 (ollama) and localhost:1234 (LM Studio). If reachable, they're enabled automatically. No setup required if you've already got either running.</span></div></div>
+ <div class="flow-step"><div class="n">3</div><div class="body"><b>Quota + cost tracker</b><span>Every provider call accumulates totals: input tokens, output tokens, call count, last used. For paid providers (Anthropic), live £ cost estimate. Sovereign-by-default — track only what you've already spent, no projections sent anywhere.</span></div></div>
+ <div class="flow-step"><div class="n">4</div><div class="body"><b>Iterate on existing tools</b><span>Generated a tool, want to refine it? "Refine" button on each generated tool re-runs the build with the existing HTML as context plus your modification ("add a department breakdown view", "fix the date format", "add CSV export"). Versions tracked.</span></div></div>
+ <div class="flow-step"><div class="n">5</div><div class="body"><b>Fork Seed (the strategic one)</b><span>This installer.html IS a template. Open Fork Seed → rename the vertical → edit T0 rules → edit compliance items → edit base tool URLs → edit document clauses → edit build prompt → Download fallseed-{vertical}-v1.html. You now have a sellable seed for a completely different industry. 5 minutes to spin up a new vertical.</span></div></div>
+ </div>
+ <div class="section-h"><h2>This session</h2></div>
+ <div class="inspect-grid">
+ <div class="inspect-card"><div class="num">${totalCalls}</div>
+    <div class="card" style="margin-top:18px">
+      <h3>About this seed</h3>
+      <p style="font-size:12px;color:var(--cream-dim);margin-bottom:8px">Level-0 vertical seed in the FallSeed family. Forked from <code style="color:var(--brass)">fallseed-hr</code>.</p>
+      <p style="font-size:12px;color:var(--cream-dim);margin-bottom:8px">Implements the Fork Seed primitive — read the <a href="https://www.ai-nativesolutions.com/spec.html" target="_blank" rel="noopener" style="color:var(--brass)">public spec</a> for the four invariants of replication, the SEED schema, and the six-step fork protocol that every conforming seed implements.</p>
+      <p style="font-size:11px;color:var(--cream-muted);font-family:var(--mono);letter-spacing:.06em">level <span style="color:var(--brass)">0</span> · parent <span style="color:var(--brass)">fallseed-hr</span> · MIT</p>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <h3>Fellow seeds online</h3>
+      <p style="font-size:12px;color:var(--cream-dim);margin-bottom:10px">Other FallSeeds reachable on this origin via the <code style="color:var(--brass)">fall-signal</code> mesh. Updates every 30 seconds.</p>
+      <div id="fellowSeedsList" style="font-family:var(--mono);font-size:11px;color:var(--cream-dim)">${(function(){const peers=Array.from(window.__fellowSeeds?.values?.()||[]); if(!peers.length) return '<div style="color:var(--cream-muted)">none detected · open another FallSeed on this domain to see it appear here</div>'; return peers.sort((a,b)=>(a.name||'').localeCompare(b.name||'')).map(p=>`<div style="padding:6px 0;border-bottom:1px solid var(--line-soft)"><span style="color:var(--brass)">${esc(p.source||'?')}</span> · prime <span style="color:var(--brass)">${esc(String(p.prime||'?'))}</span> · v${esc(String(p.version||'?'))} · level ${esc(String(p.level??'?'))}${p.parent?' · forked from '+esc(p.parent):''} · last seen ${Math.round((Date.now()-(p.lastSeen||0))/1000)}s ago</div>`).join('');})()}</div>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <h3>Flavour from fallrecall</h3>
+      <p style="font-size:12px;color:var(--cream-dim);margin-bottom:10px">Pull your analysed flavour profile (voice, interests, preferences, anti-prefs) from <a href="https://sjgant80-hub.github.io/fallrecall/" target="_blank" rel="noopener" style="color:var(--brass)">fallrecall</a>. If fallrecall is open on this origin, the pull happens instantly via the cross-seed mesh.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <button class="btn brass sm" onclick="pullFlavourFromRecall()">⌬ pull flavour →</button>
+        <a href="https://sjgant80-hub.github.io/fallrecall/" target="_blank" rel="noopener" class="btn sm ghost">open fallrecall ↗</a>
+      </div>
+      <div id="flavourStatus" style="font-family:var(--mono);font-size:11px;color:var(--cream-muted);letter-spacing:.04em">${(function(){if(!window.__flavourProfile)return '<span style="color:var(--cream-muted)">no profile loaded · click pull above (fallrecall must be open in another tab)</span>'; const p=window.__flavourProfile; return '<span style=\"color:var(--green)\">✓ loaded ' + new Date(window.__flavourLoadedAt).toLocaleString() + '</span><br>' + (p.voiceNotes?.length||0) + ' voice notes · ' + (p.recurringInterests?.length||0) + ' interests · ' + (p.preferences?.length||0) + ' preferences · ' + (p.antiPreferences?.length||0) + ' anti-prefs';})()}</div>
+    </div><div class="lbl">Total cascade calls</div></div>
+ <div class="inspect-card"><div class="num">${totalTokens.toLocaleString()}</div><div class="lbl">Total tokens</div></div>
+ <div class="inspect-card"><div class="num">${state.generated.length}</div><div class="lbl">Tools generated</div></div>
+ <div class="inspect-card"><div class="num">${state.autoDetected.length}</div><div class="lbl">Auto-detected local LLMs</div></div>
+ </div>
+ <div style="margin-top:20px;display:flex;gap:10px;flex-wrap:wrap">
+ <button class="btn brass big" onclick="switchTab('build')">Build a tool →</button>
+ <button class="btn big" onclick="switchTab('packager')">Fork this seed →</button>
+ <button class="btn big" onclick="switchTab('providers')">LLM Providers →</button>
+ </div>`;
+}
+function renderInstall(v) {
+ const f = state.firm || {};
+ v.innerHTML = `
+ <div class="section-h"><h2>Install</h2><div class="sub">configure firm · open base tools</div></div>
+ <div class="card">
+ <h3>Step 1 · Configure firm</h3>
+ <div class="row"><div class="field"><label>Firm name</label><input id="fName" value="${esc(f.name||'')}" placeholder="e.g. Northgate Sciences Ltd"></div><div class="field"><label>Company no</label><input id="fCoNo" value="${esc(f.companyNo||'')}" placeholder="09876543"></div></div>
+ <div class="field" style="margin-bottom:10px"><label>Registered address</label><input id="fAddr" value="${esc(f.address||'')}" placeholder="21 King Street, Manchester M2 4WQ"></div>
+ <div class="row"><div class="field"><label>PAYE reference</label><input id="fPaye" value="${esc(f.payeRef||'')}" placeholder="120/AB12345"></div><div class="field"><label>Accounts office ref</label><input id="fAor" value="${esc(f.aorRef||'')}" placeholder="120PA00012345"></div></div>
+ <button class="btn brass" onclick="provisionFirm()" style="margin-top:8px">Provision firm config</button>
+ <div class="status-line" id="provisionStatus">${state.firm?'<span style="color:var(--green)">✓ firm provisioned: '+esc(state.firm.name)+'</span>':'firm not yet provisioned'}</div>
+ </div>
+ <div class="section-h"><h2>Step 2 · Your four base tools</h2><div class="sub">already live · click to open</div></div>
+ <div class="tool-grid">
+ ${SEED.baseTools.map(t => `
+ <div class="tool-card" onclick="openTool('${t.url}','${t.name}')">
+ <div class="role">${t.role} · prime ${t.prime}</div>
+ <div class="name">${esc(t.name)}</div>
+ <div class="purpose">${esc(t.purpose)}</div>
+ <div class="prime">↗ open ${t.url}</div>
+ </div>
+ `).join('')}
+ </div>`;
+}
+async function provisionFirm() {
+ const f = { name:$('#fName').value.trim(), companyNo:$('#fCoNo').value.trim(), address:$('#fAddr').value.trim(), payeRef:$('#fPaye').value.trim(), aorRef:$('#fAor').value.trim(), provisionedAt:now() };
+ if (!f.name) { toast('Firm name required'); return; }
+ state.firm = f; await idbPut('config', f, 'firm');
+ try { new BroadcastChannel('fall-ifa').postMessage({ v:1, type:'firm.provisioned', source:'fallseed-ifa-v2', payload:{firm:f} }); } catch(e){}
+ toast('Firm provisioned'); render();
+}
+function renderBuild(v) {
+ const enabledProviders = PROVIDERS.filter(p => state.providerConfig[p.id]?.enabled && (!p.requiresKey || state.providerConfig[p.id]?.key));
+ v.innerHTML = `
+ <div class="section-h"><h2>Build New Tool</h2><div class="sub">${enabledProviders.length} provider${enabledProviders.length===1?'':'s'} ready · cascade: ${enabledProviders.map(p=>p.name).join(' → ')||'none'}</div></div>
+ ${enabledProviders.length===0 ? `<div class="disclaimer"><strong>No LLM provider configured.</strong> Cheapest sovereign: install ollama (no key). Cheapest cloud: 30-sec free signup at <a href="https://console.groq.com/keys" target="_blank" style="color:var(--brass)">console.groq.com</a>. Configure in <a onclick="switchTab('providers')" style="color:var(--brass);cursor:pointer">LLM Providers</a>.</div>` : ''}
+ <div class="card">
+ <h3>What tool do you need?</h3>
+ <textarea id="buildPrompt" rows="4" placeholder="e.g. 'Track Display Screen Equipment workstation assessments — one per employee per year, flag overdue. Reference H&S DSE Regs 1992.'"></textarea>
+ <div class="example-chips">
+ <button onclick="usePrompt('DSE workstation assessment tracker — one per employee per year, flag overdue, reference H&amp;S DSE Regs 1992')">DSE assessment tracker</button>
+ <button onclick="usePrompt('Mandatory training register — track which employees have completed which courses (fire safety, GDPR, anti-bribery) with expiry dates')">Training register</button>
+ <button onclick="usePrompt('Bonus calculator — annual bonus pool allocation by employee weighted by performance review rating')">Bonus calculator</button>
+ <button onclick="usePrompt('Leaver checklist — exit interview, equipment return, access revocation, P45, references')">Leaver checklist</button>
+ <button onclick="usePrompt('Expense claim register — submission, approval workflow, mileage at 45p/25p rate, receipts, payroll integration')">Expense claims</button>
+ </div>
+ <div style="display:flex;gap:10px;margin-top:8px">
+ <button class="btn brass big" id="buildBtn" onclick="runBuild()" ${enabledProviders.length===0?'disabled':''}>Generate tool (streaming)</button>
+ </div>
+ <div class="status-line" id="buildStatus">${enabledProviders.length?'engine ready · cascade will try '+enabledProviders.length+' provider'+(enabledProviders.length===1?'':'s'):'no provider configured'}</div>
+ <div id="cascadeTrace"></div>
+ </div>
+ <div class="build-stage">
+ <div>
+ <h3>Generated HTML (streaming)</h3>
+ <div class="preview-area" id="genOutput">(token stream will appear here as the LLM writes)</div>
+ <div style="display:flex;gap:8px;margin-top:8px">
+ <button class="btn sm" id="downloadBtn" onclick="downloadGenerated()" disabled>↓ Download HTML</button>
+ <button class="btn sm" id="openBtn" onclick="openGenerated()" disabled>↗ Open in new tab</button>
+ </div>
+ </div>
+ <div>
+ <h3>Live preview (renders as it streams)</h3>
+ <iframe id="livePreview" style="width:100%;height:60vh;border:1px solid var(--line);border-radius:4px;background:white;display:none"></iframe>
+ <div class="preview-area" id="livePreviewPlaceholder" style="min-height:60vh">(iframe will render the tool as the HTML streams in)</div>
+ </div>
+ </div>
+ ${state.generated.length ? `
+ <div class="section-h" style="margin-top:30px"><h2>Generated tools</h2><div class="sub">${state.generated.length}</div></div>
+ <div class="inspect-list">
+ ${state.generated.slice().reverse().map(g => `
+ <div class="inspect-item">
+ <div class="key">${esc(g.toolName)} · ${esc(g.provider||'?')} · v${g.version||1} · ${new Date(g.ts).toLocaleString('en-GB')}</div>
+ <div style="font-size:12px;color:var(--cream-dim);margin-bottom:6px">${esc(g.prompt.slice(0,200))}${g.prompt.length>200?'…':''}</div>
+ <div style="display:flex;gap:6px;flex-wrap:wrap">
+ <button class="btn sm" onclick="reopenGenerated('${g.id}')">↗ Open</button>
+ <button class="btn sm" onclick="redownloadGenerated('${g.id}')">↓ Download</button>
+ <button class="btn sm brass" onclick="refineGenerated('${g.id}')">✦ Refine</button>
+ </div>
+ </div>
+ `).join('')}
+ </div>
+ ` : ''}`;
+}
+function usePrompt(text) { $('#buildPrompt').value = text; }
+function renderCascadeTrace(trace) {
+ const el = $('#cascadeTrace');
+ if (!el) return;
+ el.innerHTML = '<div class="cascade-trace">' + trace.map(t => `<div class="line ${t.status}"><span class="t">${t.status.toUpperCase().padEnd(4)}</span><span class="p">${esc(t.provider)}</span> · ${esc(t.reason)}${t.ms?' · '+t.ms+'ms':''}</div>`).join('') + '</div>';
+}
+let lastGenerated = null;
+let refineSourceId = null;
+async function runBuild() {
+ const prompt = $('#buildPrompt').value.trim();
+ if (!prompt) { toast('Describe what you need'); return; }
+ const btn = $('#buildBtn');
+ btn.disabled = true; btn.textContent = 'Streaming...';
+ const out = $('#genOutput');
+ const iframe = $('#livePreview');
+ const placeholder = $('#livePreviewPlaceholder');
+ out.classList.add('streaming');
+ out.classList.remove('busy');
+ out.textContent = '';
+ iframe.style.display = 'block';
+ placeholder.style.display = 'none';
+ iframe.srcdoc = '<html><body style="font:14px Inter;padding:20px;color:#666">Awaiting first token...</body></html>';
+ let baseUserMsg = `Generate a complete sovereign HTML tool for this need:
+"${prompt}"
+CONTEXT — the user's existing HR T0 rules (reference what's relevant in your tool's Q&A panel):
+${SEED.t0Rules.map(r => `- ${r.pattern} → ${r.answer}`).join('\n')}
+EXISTING WEDGE BASE TOOLS (your new tool meshes with these via fall-hr BroadcastChannel):
+${SEED.baseTools.map(t => `- ${t.name} (${t.role}, prime ${t.prime}): ${t.purpose}`).join('\n')}
+OUTPUT: complete single HTML file. Start with <!DOCTYPE html>. End with </html>. No preamble. No code fences.`;
+ // V2 · if refining, prepend existing HTML
+ let refineSource = null;
+ if (refineSourceId) {
+ refineSource = state.generated.find(g => g.id === refineSourceId);
+ if (refineSource) {
+ baseUserMsg = `Here is an existing tool you previously generated:
+<<<EXISTING_HTML_BEGIN>>>
+${refineSource.html}
+<<<EXISTING_HTML_END>>>
+The user wants to refine it. Their modification request:
+"${prompt}"
+OUTPUT the complete updated HTML file with the modification applied. Preserve everything that works. Start with <!DOCTYPE html>. End with </html>. No preamble. No code fences.`;
+ }
+ }
+ try {
+ const result = await runCascadeStream(SEED.buildPromptSystem, baseUserMsg, 16000,
+ (currentText) => {
+ // Render incremental text in code panel + try to render in iframe
+ out.textContent = currentText.length > 12000 ? currentText.slice(-12000) : currentText;
+ out.scrollTop = out.scrollHeight;
+ // Try to render iframe if we have enough HTML start
+ if (currentText.includes('<body') && currentText.length > 500) {
+ try { iframe.srcdoc = currentText + (currentText.includes('</html>') ? '' : '\n<!-- streaming... --></body></html>'); } catch(e){}
+ }
+ },
+ renderCascadeTrace
+ );
+ let html = result.text.replace(/^```html\n?/, '').replace(/\n?```\s*$/, '').trim();
+ if (!html.startsWith('<!DOCTYPE') && !html.startsWith('<html')) {
+ throw new Error('LLM did not return HTML. Got: ' + html.slice(0, 200));
+ }
+ out.classList.remove('streaming');
+ const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
+ const primeMatch = html.match(/<meta\s+name=["']prime["']\s+content=["'](\d+)["']/i);
+ const nameGuess = (titleMatch?.[1] || '').match(/falladv\w*/i)?.[0] || 'falladv_' + Math.random().toString(36).slice(2,7);
+ lastGenerated = {
+ id: uid('gen'), ts: now(), prompt,
+ toolName: nameGuess,
+ prime: primeMatch ? Number(primeMatch[1]) : null,
+ html,
+ provider: result.provider.name, model: result.model,
+ tokensIn: result.tokensIn, tokensOut: result.tokensOut,
+ version: refineSource ? (refineSource.version || 1) + 1 : 1,
+ refinedFrom: refineSourceId
+ };
+ state.generated.push(lastGenerated);
+ await idbPut('generated', lastGenerated);
+ refineSourceId = null; // clear after use
+ out.textContent = html.slice(0, 8000) + (html.length > 8000 ? '\n\n... (' + (html.length - 8000) + ' more bytes — full file in download)' : '');
+ $('#downloadBtn').disabled = false; $('#openBtn').disabled = false;
+ const blob = new Blob([html], { type: 'text/html' });
+ const url = URL.createObjectURL(blob);
+ iframe.src = url;
+ placeholder.style.display = 'none';
+ $('#buildStatus').innerHTML = `<span style="color:var(--green)">✓ ${nameGuess} via ${result.provider.name} · ${html.length.toLocaleString()} chars · ${result.tokensIn}→${result.tokensOut} tokens${result.provider.paid?' · ~£'+((result.tokensIn*result.provider.pricePer1MIn+result.tokensOut*result.provider.pricePer1MOut)/1000000).toFixed(4):''}</span>`;
+ toast('Generated via ' + result.provider.name);
+ render(); // refresh generated-tools list
+ } catch (e) {
+ out.classList.remove('streaming');
+ out.textContent = '❌ ' + e.message;
+ $('#buildStatus').innerHTML = `<span style="color:var(--red)">cascade failed</span>`;
+ toast('Build failed');
+ } finally {
+ btn.disabled = false; btn.textContent = 'Generate tool (streaming)';
+ }
+}
+function refineGenerated(id) {
+ const g = state.generated.find(x => x.id === id);
+ if (!g) return;
+ refineSourceId = id;
+ switchTab('build');
+ setTimeout(() => {
+ $('#buildPrompt').value = '';
+ $('#buildPrompt').placeholder = `Refining ${g.toolName} (v${g.version||1}). Describe what to change. e.g. "Add a CSV export button", "Add a department filter", "Fix the date format to UK"`;
+ $('#buildPrompt').focus();
+ $('#buildStatus').innerHTML = `<span style="color:var(--brass)">↻ refining ${g.toolName} v${g.version||1} → v${(g.version||1)+1}</span>`;
+ }, 100);
+}
+function downloadGenerated() {
+ if (!lastGenerated) return;
+ const blob = new Blob([lastGenerated.html], { type: 'text/html' });
+ const url = URL.createObjectURL(blob);
+ const a = document.createElement('a');
+ a.href = url; a.download = lastGenerated.toolName + '.html';
+ document.body.appendChild(a); a.click(); a.remove();
+ URL.revokeObjectURL(url);
+ toast('Downloaded ' + lastGenerated.toolName + '.html');
+}
+function openGenerated() {
+ if (!lastGenerated) return;
+ const blob = new Blob([lastGenerated.html], { type: 'text/html' });
+}
+function reopenGenerated(id) {
+ const g = state.generated.find(x => x.id === id);
+ if (!g) return;
+ const blob = new Blob([g.html], { type: 'text/html' });
+}
+function redownloadGenerated(id) {
+ const g = state.generated.find(x => x.id === id);
+ if (!g) return;
+ const blob = new Blob([g.html], { type: 'text/html' });
+ const url = URL.createObjectURL(blob);
+ const a = document.createElement('a');
+ a.href = url; a.download = g.toolName + '.html';
+ document.body.appendChild(a); a.click(); a.remove();
+}
+// ═══════════════════════════════════════════════════════════════
+// V2 · PROVIDERS WITH QUOTA + AUTO-DETECT FLAGS
+// ═══════════════════════════════════════════════════════════════
+function renderProviders(v) {
+ v.innerHTML = `
+ <div class="section-h"><h2>LLM Providers</h2><div class="sub">cascade · sovereign first · paid last · ${state.autoDetected.length} auto-detected</div></div>
+ <div class="card" style="font-size:13px;line-height:1.7;color:var(--cream-dim)">
+ Cascade tries providers in priority order. <strong style="color:var(--green)">v2 auto-detected:</strong> ${state.autoDetected.length?state.autoDetected.map(id => PROVIDERS.find(p=>p.id===id)?.name).join(', '):'none (start ollama on :11434 or LM Studio on :1234 and reload)'}
+ </div>
+ ${PROVIDERS.map(p => {
+ const cfg = state.providerConfig[p.id] || {};
+ const rl = state.rateLimits[p.id];
+ const isRL = rl && rl.until > now();
+ const u = state.usage[p.id] || { totalIn:0, totalOut:0, calls:0 };
+ const cost = p.paid ? (u.totalIn*p.pricePer1MIn + u.totalOut*p.pricePer1MOut)/1000000 : 0;
+ const autoDetected = state.autoDetected.includes(p.id);
+ return `
+ <div class="card" style="margin-bottom:10px">
+ <div class="provider-row" style="border:none;margin-bottom:0;padding:4px 0">
+ <div class="toggle ${cfg.enabled?'on':''}" onclick="toggleProvider('${p.id}')"></div>
+ <span class="tier-tag ${p.tier==='T1'?'t1':p.tier==='T2'?'t2':p.tier==='T3-free'?'tf':'tp'}">${p.tier}</span>
+ <div>
+ <div class="nm">${esc(p.name)} ${autoDetected?'<span style="color:var(--green);font-size:9px">● AUTO</span>':''}</div>
+ <div style="font-size:11px;color:var(--cream-muted);margin-top:2px">${esc(p.note)}</div>
+ </div>
+ <div class="status-mini">${isRL?'<span style="color:var(--red)">rate-limited</span>':p.tierLabel}</div>
+ ${p.signupUrl?`<a href="${p.signupUrl}" target="_blank" class="btn sm" style="text-align:center;text-decoration:none">↗ key</a>`:'<div></div>'}
+ </div>
+ ${p.requiresKey?`<div class="field" style="margin-top:10px"><label>${esc(p.name)} API key</label><input type="password" class="key-input" id="pkey_${p.id}" value="${esc(cfg.key||'')}" placeholder="paste key" onchange="updateProviderKey('${p.id}',this.value)"></div>`:''}
+ ${p.id==='webllm'?`<div style="margin-top:10px;font-size:11px;color:var(--cream-muted)">Status: <strong style="color:${state.webllmStatus==='ready'?'var(--green)':state.webllmStatus==='loading'?'var(--amber)':'var(--cream-muted)'}">${state.webllmStatus}</strong> ${navigator.gpu?'· WebGPU ✓':'· <span style="color:var(--red)">WebGPU NOT available — needs Chrome 113+</span>'}</div>`:''}
+ ${p.tier==='T2'?`<div style="margin-top:10px;font-size:11px;color:var(--cream-muted)">Endpoint: <code style="background:var(--ink);padding:1px 5px;border-radius:2px">${esc(p.endpoint)}</code> · <button class="btn sm" onclick="testProvider('${p.id}')">Test</button> <span id="ptest_${p.id}"></span></div>`:''}
+ ${p.requiresKey?`<div class="field" style="margin-top:8px"><label>Model override (optional)</label><input class="key-input" id="pmodel_${p.id}" value="${esc(cfg.customModel||'')}" placeholder="default: ${esc(p.model)}" onchange="updateProviderModel('${p.id}',this.value)"></div>`:''}
+ <div class="quota-bar" style="margin-top:10px;margin-bottom:0">
+ <div class="nm">${u.calls} calls</div>
+ <div class="stats">in ${u.totalIn.toLocaleString()} · out ${u.totalOut.toLocaleString()} · total ${(u.totalIn+u.totalOut).toLocaleString()} tokens</div>
+ <div class="cost">${p.paid?('£'+cost.toFixed(4)):'free'}</div>
+ </div>
+ </div>`;
+ }).join('')}
+ <div class="card">
+ <h3>Cascade test</h3>
+ <button class="btn brass" onclick="testCascade()">Test cascade with "say hi" (streaming)</button>
+ <div id="cascadeTestResult" style="margin-top:10px"></div>
+ </div>`;
+}
+async function toggleProvider(id) {
+ state.providerConfig[id].enabled = !state.providerConfig[id].enabled;
+ state.providerConfig[id].userToggled = true;
+ await persistProviderConfig(); render();
+}
+async function updateProviderKey(id, key) {
+ state.providerConfig[id].key = key.trim();
+ await persistProviderConfig(); updateTierBadge(); toast('Key saved');
+}
+async function updateProviderModel(id, model) {
+ state.providerConfig[id].customModel = model.trim();
+ await persistProviderConfig(); toast('Model override saved');
+}
+async function testProvider(id) {
+ const p = PROVIDERS.find(x => x.id === id);
+ const el = $('#ptest_' + id);
+ if (!p) return;
+ el.innerHTML = ' <span style="color:var(--amber)">testing...</span>';
+ const avail = await providerAvailable(p);
+ if (!avail.ok) { el.innerHTML = ` <span style="color:var(--red)">✗ ${esc(avail.reason)}</span>`; return; }
+ el.innerHTML = ' <span style="color:var(--green)">✓ reachable</span>';
+}
+async function testCascade() {
+ const el = $('#cascadeTestResult');
+ el.innerHTML = '<div class="cascade-trace"><div class="line try">running cascade...</div></div>';
+ let streamText = '';
+ try {
+ const result = await runCascadeStream(
+ 'You are a test. Reply with exactly one word.',
+ 'Say hi.',
+ 30,
+ (t) => { streamText = t; el.querySelector('.cascade-trace').innerHTML += ''; }, // updates per token but we just need final
+ (trace) => el.innerHTML = '<div class="cascade-trace">' + trace.map(t => `<div class="line ${t.status}"><span class="t">${t.status.toUpperCase().padEnd(4)}</span><span class="p">${esc(t.provider)}</span> · ${esc(t.reason)}${t.ms?' · '+t.ms+'ms':''}</div>`).join('') + '</div>'
+ );
+ el.innerHTML += `<div style="margin-top:8px;color:var(--green);font-family:var(--mono);font-size:11px">✓ "${esc(result.text.trim().slice(0,80))}" from ${esc(result.provider.name)} (${result.model})</div>`;
+ } catch (e) {
+ el.innerHTML += `<div style="margin-top:8px;color:var(--red);font-family:var(--mono);font-size:11px">✗ ${esc(e.message)}</div>`;
+ }
+}
+// ═══════════════════════════════════════════════════════════════
+// V2 · PACKAGER · fork this seed into a new vertical
+// ═══════════════════════════════════════════════════════════════
+function ensureDraft() {
+ if (!state.pkgDraft) state.pkgDraft = JSON.parse(JSON.stringify(SEED));
+ return state.pkgDraft;
+}
+function renderPackager(v) {
+ const d = ensureDraft();
+ v.innerHTML = `
+ <div class="section-h"><h2>Fork Seed</h2><div class="sub">turn this HR seed into a seed for any other vertical</div></div>
+ <div class="card" style="font-size:13px;line-height:1.7;color:var(--cream-dim)">
+ <strong style="color:var(--brass)">The strategic mechanic.</strong> Edit the seed fields below — rename vertical, swap T0 rules, swap base-tool URLs, swap document clauses, rewrite the build prompt — then click <strong>Download fallseed-{vertical}-v1.html</strong>. You get a complete new installer.html for any vertical (clinic, vet, recruit, construction, marketing, pharmacy, dentist, education, hospitality, transport, anything). Same shape, different substrate. 5 minutes to spin up a sellable seed for a new industry.
+ </div>
+ <div class="card">
+ <h3>Manifest</h3>
+ <div class="fork-grid">
+ <div class="field"><label>Vertical name (e.g. hr-firm)</label><input id="pkgName" value="${esc(d.manifest.name)}" onchange="updateDraftField('manifest.name', this.value)"></div>
+ <div class="field"><label>Vertical description</label><input id="pkgDesc" value="${esc(d.manifest.vertical)}" onchange="updateDraftField('manifest.vertical', this.value)"></div>
+ <div class="field"><label>Mesh channel</label><input id="pkgMesh" value="${esc(d.manifest.meshChannel)}" onchange="updateDraftField('manifest.meshChannel', this.value)" placeholder="fall-{vertical}"></div>
+ <div class="field"><label>Seed prime</label><input id="pkgPrime" value="${esc(d.manifest.prime)}" onchange="updateDraftField('manifest.prime', Number(this.value))"></div>
+ </div>
+ </div>
+ <div class="card">
+ <h3>Base tools (${d.baseTools.length})</h3>
+ <p style="font-size:12px;color:var(--cream-dim);margin-bottom:8px">URLs of the 4 live wedge tools for this vertical. Edit or replace with your new vertical's URLs.</p>
+ <div class="editable-list" id="baseToolsList">
+ ${d.baseTools.map((t,i) => `
+ <div class="editable-row" style="grid-template-columns:80px 1fr 1fr auto">
+ <input value="${esc(t.role)}" onchange="updateBaseTool(${i},'role',this.value)" placeholder="role">
+ <input value="${esc(t.name)}" onchange="updateBaseTool(${i},'name',this.value)" placeholder="fall{vertical}{role}">
+ <input value="${esc(t.url)}" onchange="updateBaseTool(${i},'url',this.value)" placeholder="https://...">
+ <span class="x" onclick="removeBaseTool(${i})">✗</span>
+ </div>
+ <div style="margin-bottom:8px">
+ <input value="${esc(t.purpose)}" onchange="updateBaseTool(${i},'purpose',this.value)" placeholder="purpose" style="font-size:11px">
+ </div>
+ `).join('')}
+ </div>
+ <button class="btn sm" onclick="addBaseTool()" style="margin-top:8px">+ add tool</button>
+ </div>
+ <div class="card">
+ <h3>T0 rules (${d.t0Rules.length})</h3>
+ <p style="font-size:12px;color:var(--cream-dim);margin-bottom:8px">Hard-coded regulatory Q&A pairs. Pattern is a regex; answer is plain text. Replace the HR rules with rules for your new vertical (e.g. CQC for clinic, RCVS for vet, MCOB for mortgage).</p>
+ <div class="editable-list" id="t0RulesList">
+ ${d.t0Rules.map((r,i) => `
+ <div class="editable-row">
+ <input value="${esc(r.pattern)}" onchange="updateT0(${i},'pattern',this.value)" placeholder="regex pattern">
+ <input value="${esc(r.answer)}" onchange="updateT0(${i},'answer',this.value)" placeholder="answer">
+ <span class="x" onclick="removeT0(${i})">✗</span>
+ </div>
+ `).join('')}
+ </div>
+ <button class="btn sm" onclick="addT0()" style="margin-top:8px">+ add T0 rule</button>
+ </div>
+ <div class="card">
+ <h3>Compliance checklist (${d.complianceItems.length})</h3>
+ <div class="editable-list" id="complianceList">
+ ${d.complianceItems.map((c,i) => `
+ <div class="editable-row" style="grid-template-columns:1fr auto">
+ <input value="${esc(c)}" onchange="updateCompliance(${i},this.value)">
+ <span class="x" onclick="removeCompliance(${i})">✗</span>
+ </div>
+ `).join('')}
+ </div>
+ <button class="btn sm" onclick="addCompliance()" style="margin-top:8px">+ add compliance item</button>
+ </div>
+ <div class="card">
+ <h3>Locked clauses (${d.documentClauses.length})</h3>
+ <div class="editable-list" id="clausesList">
+ ${d.documentClauses.map((c,i) => `
+ <div class="editable-row">
+ <input value="${esc(c.code)}" onchange="updateClause(${i},'code',this.value)" placeholder="code">
+ <input value="${esc(c.text)}" onchange="updateClause(${i},'text',this.value)" placeholder="locked clause text">
+ <span class="x" onclick="removeClause(${i})">✗</span>
+ </div>
+ `).join('')}
+ </div>
+ <button class="btn sm" onclick="addClause()" style="margin-top:8px">+ add clause</button>
+ </div>
+ <div class="card">
+ <h3>Build-prompt (the LLM's instructions for generating new tools in this vertical)</h3>
+ <textarea id="pkgBuildPrompt" rows="20" style="font-size:11px;font-family:var(--mono)" onchange="updateDraftField('buildPromptSystem', this.value)">${esc(d.buildPromptSystem)}</textarea>
+ </div>
+ <div class="card" style="border-color:var(--brass);background:rgba(184,151,74,0.05)">
+ <h3 style="color:var(--brass)">Export the forked seed</h3>
+ <p style="font-size:13px;color:var(--cream-dim);margin-bottom:12px">Download a complete installer-{vertical}-v1.html that ships with all your edits. It's a working FallSeed for your new vertical, ready to use or sell.</p>
+ <div style="display:flex;gap:8px;flex-wrap:wrap">
+ <button class="btn brass big" onclick="downloadForkedSeed()">↓ Download fallseed-${esc(d.manifest.name)}-v1.html</button>
+ <button class="btn big" onclick="saveDraftAsCurrent()">Save as current seed (use here now)</button>
+ <button class="btn ghost big" onclick="resetDraft()">↺ Reset to HR default</button>
+ </div>
+ </div>`;
+}
+function updateDraftField(path, value) {
+ const d = ensureDraft();
+ const parts = path.split('.');
+ let cur = d;
+ for (let i=0; i<parts.length-1; i++) cur = cur[parts[i]];
+ cur[parts[parts.length-1]] = value;
+}
+function updateBaseTool(i, field, value) { ensureDraft().baseTools[i][field] = value; }
+function removeBaseTool(i) { ensureDraft().baseTools.splice(i, 1); render(); }
+function addBaseTool() { ensureDraft().baseTools.push({ role:'', name:'', prime:0, url:'', purpose:'' }); render(); }
+function updateT0(i, field, value) { ensureDraft().t0Rules[i][field] = value; }
+function removeT0(i) { ensureDraft().t0Rules.splice(i, 1); render(); }
+function addT0() { ensureDraft().t0Rules.push({ pattern:'', answer:'' }); render(); }
+function updateCompliance(i, value) { ensureDraft().complianceItems[i] = value; }
+function removeCompliance(i) { ensureDraft().complianceItems.splice(i, 1); render(); }
+function addCompliance() { ensureDraft().complianceItems.push(''); render(); }
+function updateClause(i, field, value) { ensureDraft().documentClauses[i][field] = value; }
+function removeClause(i) { ensureDraft().documentClauses.splice(i, 1); render(); }
+function addClause() { ensureDraft().documentClauses.push({ code:'', text:'' }); render(); }
+async function saveDraftAsCurrent() {
+ if (!state.pkgDraft) { toast('No draft'); return; }
+ if (!confirm('Replace the active SEED with your draft? This will change what the Build Engine knows.')) return;
+ SEED = JSON.parse(JSON.stringify(state.pkgDraft));
+ await idbPut('config', SEED, 'forkedSeed');
+ toast('Active seed replaced'); render();
+}
+function resetDraft() {
+ if (!confirm('Reset draft to the HR default? Edits will be lost.')) return;
+ state.pkgDraft = JSON.parse(JSON.stringify(SEED_DEFAULT));
+ render();
+}
+function downloadForkedSeed() {
+ const d = ensureDraft();
+ // Fetch this very HTML, swap the SEED_DEFAULT block, return as new file
+ // Find the SEED_DEFAULT object literal and replace it
+ const seedStart = currentHtml.indexOf('const SEED_DEFAULT = {');
+ if (seedStart < 0) { toast('Cannot find SEED_DEFAULT in source'); return; }
+ // Find matching close brace + semicolon — walk braces
+ let depth = 0, end = -1;
+ for (let i = seedStart + 'const SEED_DEFAULT = '.length; i < currentHtml.length; i++) {
+ const c = currentHtml[i];
+ if (c === '{') depth++;
+ else if (c === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+ }
+ if (end < 0) { toast('Cannot parse SEED_DEFAULT'); return; }
+ const newSeedLiteral = 'const SEED_DEFAULT = ' + jsLiteral(d);
+ const newHtml = currentHtml.slice(0, seedStart) + newSeedLiteral + currentHtml.slice(end);
+ const blob = new Blob([newHtml], { type: 'text/html' });
+ const url = URL.createObjectURL(blob);
+ const a = document.createElement('a');
+ a.href = url; a.download = 'fallseed-' + (d.manifest.name||'forked') + '-v1.html';
+ document.body.appendChild(a); a.click(); a.remove();
+ URL.revokeObjectURL(url);
+ toast('Downloaded fallseed-' + d.manifest.name + '-v1.html (' + Math.round(newHtml.length/1024) + ' KB)');
+ }).catch(e => toast('Fetch failed: ' + e.message));
+}
+// Render a JS object as a JS literal (not JSON) so it parses with template literals etc.
+function jsLiteral(obj, indent = 0) {
+ const pad = ' '.repeat(indent);
+ const padNext = ' '.repeat(indent+1);
+ if (obj === null) return 'null';
+ if (typeof obj === 'string') return '`' + obj.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${') + '`';
+ if (typeof obj === 'number' || typeof obj === 'boolean') return String(obj);
+ if (Array.isArray(obj)) {
+ if (!obj.length) return '[]';
+ return '[\n' + obj.map(v => padNext + jsLiteral(v, indent+1)).join(',\n') + '\n' + pad + ']';
+ }
+ if (typeof obj === 'object') {
+ const keys = Object.keys(obj);
+ if (!keys.length) return '{}';
+ return '{\n' + keys.map(k => padNext + (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(k)?k:JSON.stringify(k)) + ': ' + jsLiteral(obj[k], indent+1)).join(',\n') + '\n' + pad + '}';
+ }
+ return JSON.stringify(obj);
+}
+// ═══════════════════════════════════════════════════════════════
+// INSPECT + SETTINGS
+// ═══════════════════════════════════════════════════════════════
+function renderInspect(v) {
+ v.innerHTML = `
+ <div class="section-h"><h2>Inspect Seed</h2><div class="sub">currently loaded · use Fork Seed to edit</div></div>
+ <div class="inspect-grid">
+ <div class="inspect-card"><div class="num">${SEED.baseTools.length}</div><div class="lbl">Base tools</div></div>
+ <div class="inspect-card"><div class="num">${SEED.t0Rules.length}</div><div class="lbl">T0 rules</div></div>
+ <div class="inspect-card"><div class="num">${SEED.complianceItems.length}</div><div class="lbl">Compliance items</div></div>
+ <div class="inspect-card"><div class="num">${SEED.documentClauses.length}</div><div class="lbl">Locked clauses</div></div>
+ <div class="inspect-card"><div class="num">${PROVIDERS.length}</div><div class="lbl">LLM providers</div></div>
+ <div class="inspect-card"><div class="num">${SEED.manifest.prime}</div><div class="lbl">Seed prime</div></div>
+ </div>
+ <div class="section-h"><h2>Manifest</h2></div>
+ <div class="code-block">${esc(JSON.stringify(SEED.manifest, null, 2))}</div>
+ <div class="section-h"><h2>T0 rules</h2></div>
+ <div class="inspect-list">${SEED.t0Rules.map(r => `<div class="inspect-item"><div class="key">${esc(r.pattern)}</div><div style="font-size:12px;color:var(--cream-dim)">${esc(r.answer)}</div></div>`).join('')}</div>
+ <div class="section-h"><h2>Build-prompt system instruction</h2></div>
+ <div class="code-block">${esc(SEED.buildPromptSystem)}</div>`;
+}
+function renderSettings(v) {
+ const totalCost = PROVIDERS.filter(p => p.paid).reduce((s,p) => {
+ const u = state.usage[p.id] || {totalIn:0,totalOut:0};
+ return s + (u.totalIn*p.pricePer1MIn + u.totalOut*p.pricePer1MOut)/1000000;
+ }, 0);
+ v.innerHTML = `
+ <div class="section-h"><h2>Settings</h2></div>
+ <div class="inspect-grid">
+ <div class="inspect-card"><div class="num">${state.generated.length}</div><div class="lbl">Tools generated</div></div>
+ <div class="inspect-card"><div class="num">${Object.values(state.usage).reduce((s,u)=>s+u.calls,0)}</div><div class="lbl">Total cascade calls</div></div>
+ <div class="inspect-card"><div class="num">£${totalCost.toFixed(4)}</div><div class="lbl">Total spent (paid providers)</div></div>
+ <div class="inspect-card"><div class="num">${state.firm?'1':'0'}</div><div class="lbl">Firm provisioned</div></div>
+ </div>
+ <div class="card">
+ <h3>Data</h3>
+ <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+ <button class="btn sm" onclick="exportAll()">↓ Export everything</button>
+ <button class="btn sm ghost" onclick="wipeAll()" style="border-color:var(--red);color:var(--red)">⚠ Wipe all</button>
+ </div>
+ </div>
+ <div class="card">
+ <h3>Where do my keys live?</h3>
+ <p style="font-size:12px;color:var(--cream-dim);line-height:1.7">In your browser's IndexedDB only. Each LLM call goes browser → that provider's API directly. For ollama/lmstudio: <code style="background:var(--ink);padding:1px 4px">OLLAMA_ORIGINS=* ollama serve</code></p>
+ </div>`;
+}
+function exportAll() {
+ const data = {
+ seed: 'fallseed-ifa-v2',
+ exportedAt: now(),
+ firm: state.firm,
+ providerConfig: { ...state.providerConfig },
+ usage: state.usage,
+ generatedCount: state.generated.length,
+ forkedSeedManifest: SEED.manifest
+ };
+ for (const id in data.providerConfig) data.providerConfig[id] = { ...data.providerConfig[id], key: data.providerConfig[id].key ? '[redacted]' : '' };
+ const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+ const url = URL.createObjectURL(blob);
+ const a = document.createElement('a');
+ a.href = url; a.download = 'fallseed-export.json';
+ document.body.appendChild(a); a.click(); a.remove();
+ toast('Exported (keys redacted)');
+}
+async function wipeAll() {
+ if (!confirm('Wipe all FallSeed data including keys?')) return;
+ for (const s of ['config','generated']) { const tx = db.transaction(s,'readwrite'); tx.objectStore(s).clear(); await new Promise(r => tx.oncomplete = r); }
+ location.reload();
+}
+(async function boot() {
+ try {
+ await openDB();
+ await loadAll();
+ initMesh();
+ render();
+ // V2 · auto-detect local runners in background, re-render when done
+ autoDetectProviders().then(() => render());
+ } catch (e) {
+ console.error('boot error', e);
+ $('#view').innerHTML = '<div class="card">Boot error: ' + esc(e.message) + '</div>';
+ }
+})();
+
+// Named exports for the primary API surface
+export { loadConfig };
+export { saveConfig };
+export { $ };
+export { esc };
+export { aiTier };
+export { renderAiChip };
+export { loadWebLLM };
+export { aiComplete };
+export { aiCloudCall };
+export { meshStart };
+
+export { FALL_KIT_VERSION };
+export { KCC_MINT_URL };
+export { WEBLLM_MODELS };
+export { DEFAULT_MODEL };
+export { T3_PROVIDERS };
+export { STATE };
+export { MESH_CHANNEL };
+export { STUN_SERVERS };
+export { SEED_DEFAULT };
+export { PROVIDERS };
